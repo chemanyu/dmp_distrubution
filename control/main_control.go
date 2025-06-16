@@ -66,12 +66,7 @@ func MainControl() {
 	router.Use(gin.Recovery()) // Gin 的错误恢复中间件
 	router.Use(gin.Logger())   // Gin 的日志中间件
 
-	regHandlers := []handlers.Handler{
-		handlers.GetReportApiHandler,
-		handlers.GetCpsOrderApiHandler,
-		handlers.GetCpsIncomeApiHandler,
-		handlers.GetCpsUserApiHandler,
-	}
+	regHandlers := []handlers.Handler{}
 
 	// 注册路由
 	for _, handler := range regHandlers {
