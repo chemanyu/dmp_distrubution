@@ -1,7 +1,7 @@
 package main
 
 import (
-	"report_api/control"
+	"dmp_distribution/control"
 )
 
 func main() {

@@ -2,8 +2,8 @@ package mysqldb
 
 import (
 	"database/sql"
+	"dmp_distribution/core"
 	"fmt"
-	"report_api/core"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"

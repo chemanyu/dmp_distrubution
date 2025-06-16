@@ -1,50 +1,5 @@
 package module
 
-import (
-	"time"
-
-	"gorm.io/gorm"
-	"gorm.io/driver/mysql"
-	"github.com/pkg/errors"
-	
-	"github.com/chemanyu/workspace/meishu/dmp_distribution/core"
-)
-
-var (
-	db  *gorm.DB
-	err error
-)
-
-// InitDB 初始化数据库连接
-func InitDB() error {
-	config := core.GetConfig()
-	if config == nil {
-		return errors.New("config not loaded")
-	}
-
-	db, err = gorm.Open(mysql.Open(config.MYSQL_DB), &gorm.Config{})
-	if err != nil {
-		return errors.Wrap(err, "failed to connect to database")
-	}
-
-	// 设置连接池
-	sqlDB, err := db.DB()
-	if err != nil {
-		return errors.Wrap(err, "failed to get sql.DB")
-	}
-
-	sqlDB.SetMaxIdleConns(10)
-	sqlDB.SetMaxOpenConns(100)
-	sqlDB.SetConnMaxLifetime(time.Hour)
-
-	return nil
-}
-
-// GetDB 获取数据库连接实例
-func GetDB() *gorm.DB {
-	return db
-}
-
 // Distribution 人群包分发任务表
 type Distribution struct {
 	ID         int    `gorm:"column:id;primaryKey;autoIncrement"`
@@ -68,102 +23,22 @@ func (d *Distribution) TableName() string {
 	return "dmp_distribution"
 }
 
-// DistributionModel 处理Distribution相关的数据库操作
-type DistributionModel struct {
-	db *gorm.DB
-}
-
-// NewDistributionModel 创建新的DistributionModel实例
-func NewDistributionModel(db *gorm.DB) *DistributionModel {
-	return &DistributionModel{db: db}
-}
-
-// Create 创建新的分发任务
-func (m *DistributionModel) Create(dist *Distribution) error {
-	dist.CreateTime = time.Now().Unix()
-	return m.db.Create(dist).Error
-}
-
-// GetByID 通过ID获取分发任务
-func (m *DistributionModel) GetByID(id int) (*Distribution, error) {
-	var dist Distribution
-	err := m.db.First(&dist, id).Error
-	if err != nil {
-		return nil, err
-	}
-	return &dist, nil
-}
+var (
+	DistributionMapper = new(Distribution)
+)
 
 // List 获取分发任务列表
-func (m *DistributionModel) List(query map[string]interface{}, page, pageSize int) ([]Distribution, int64, error) {
-	var dists []Distribution
-	var total int64
+func (m *Distribution) List(query map[string]interface{}, page, pageSize int) ([]Distribution, int, error) {
+	records := []Distribution{}
+	db := DbInstance.Debug()
 
-	db := m.db.Model(&Distribution{})
-
-	// 应用查询条件
-	for k, v := range query {
-		if v != nil && v != "" {
-			db = db.Where(k+" = ?", v)
-		}
-	}
-
-	// 获取总数
-	err := db.Count(&total).Error
-	if err != nil {
-		return nil, 0, err
-	}
-
-	// 获取分页数据
-	err = db.Offset((page - 1) * pageSize).
-		Limit(pageSize).
-		Order("id DESC").
-		Find(&dists).Error
-	if err != nil {
-		return nil, 0, err
-	}
-
-	return dists, total, nil
+	db.Find(&records)
+	return records, len(records), nil
 }
 
-// UpdateStatus 更新任务状态
-func (m *DistributionModel) UpdateStatus(id int, status int8) error {
-	return m.db.Model(&Distribution{}).
-		Where("id = ?", id).
-		Update("status", status).Error
-}
-
-// Update 更新分发任务
-func (m *DistributionModel) Update(id int, updates map[string]interface{}) error {
-	return m.db.Model(&Distribution{}).
-		Where("id = ?", id).
-		Updates(updates).Error
-}
-
-// Delete 删除分发任务
-func (m *DistributionModel) Delete(id int) error {
-	return m.db.Delete(&Distribution{}, id).Error
-}
-
-// BatchCreate 批量创建分发任务
-func (m *DistributionModel) BatchCreate(dists []*Distribution) error {
-	now := time.Now().Unix()
-	for _, dist := range dists {
-		dist.CreateTime = now
-	}
-	return m.db.Create(dists).Error
-}
-
-// GetByStrategyID 通过策略ID获取分发任务
-func (m *DistributionModel) GetByStrategyID(strategyID int) ([]Distribution, error) {
-	var dists []Distribution
-	err := m.db.Where("strategy_id = ?", strategyID).Find(&dists).Error
-	return dists, err
-}
-
-// UpdateStatusByIDs 批量更新任务状态
-func (m *DistributionModel) UpdateStatusByIDs(ids []int, status int8) error {
-	return m.db.Model(&Distribution{}).
-		Where("id IN ?", ids).
-		Update("status", status).Error
+func (d *Distribution) UpdateStatus(id int, status int) error {
+	// TODO: Implement the logic to update the status in the database.
+	// For example, using GORM:
+	// return db.Model(&Distribution{}).Where("id = ?", id).Update("status", status).Error
+	return nil
 }

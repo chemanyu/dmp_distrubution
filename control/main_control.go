@@ -2,14 +2,14 @@ package control
 
 import (
 	"context"
+	mysqldb "dmp_distribution/common/mysql"
+	"dmp_distribution/core"
+	handlers "dmp_distribution/handler"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
-	mysqldb "report_api/common/mysql"
-	"report_api/core"
-	handlers "report_api/handler"
 	"strings"
 	"time"
 

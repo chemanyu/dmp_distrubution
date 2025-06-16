@@ -1,4 +1,4 @@
-module report_api
+module dmp_distribution
 
 go 1.23.0
 
@@ -6,13 +6,16 @@ toolchain go1.23.8
 
 require (
 	github.com/IBM/sarama v1.45.1
+	github.com/Unknwon/goconfig v1.0.0
 	github.com/fvbock/endless v0.0.0-20170109170031-447134032cb6
 	github.com/garyburd/redigo v1.6.4
 	github.com/gin-contrib/pprof v1.5.3
 	github.com/gin-gonic/gin v1.10.0
+	github.com/go-redis/redis/v8 v8.11.5
 	github.com/go-sql-driver/mysql v1.9.2
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/google/uuid v1.6.0
+	github.com/jinzhu/gorm v1.9.16
 	github.com/json-iterator/go v1.1.12
 	github.com/klauspost/compress v1.18.0
 	github.com/panjf2000/ants/v2 v2.11.2
@@ -22,8 +25,8 @@ require (
 	github.com/spf13/viper v1.20.1
 	github.com/streadway/amqp v1.1.0
 	github.com/valyala/fasthttp v1.60.0
+	golang.org/x/net v0.38.0
 	golang.org/x/sync v0.13.0
-	gorm.io/gorm v1.30.0
 )
 
 require (
@@ -71,6 +74,7 @@ require (
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/rcrowley/go-metrics v0.0.0-20201227073835-cf1acfcdf475 // indirect
 	github.com/sagikazarmark/locafero v0.7.0 // indirect
+	github.com/smartystreets/goconvey v1.8.1 // indirect
 	github.com/sourcegraph/conc v0.3.0 // indirect
 	github.com/spf13/afero v1.12.0 // indirect
 	github.com/spf13/cast v1.7.1 // indirect
@@ -82,7 +86,6 @@ require (
 	go.uber.org/multierr v1.9.0 // indirect
 	golang.org/x/arch v0.16.0 // indirect
 	golang.org/x/crypto v0.37.0 // indirect
-	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/sys v0.32.0 // indirect
 	golang.org/x/text v0.24.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect

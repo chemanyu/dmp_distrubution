@@ -1,9 +1,9 @@
 package ginprom
 
 import (
+	"dmp_distribution/common"
 	"net/http"
 	"regexp"
-	"report_api/common"
 	"strconv"
 	"strings"
 	"time"

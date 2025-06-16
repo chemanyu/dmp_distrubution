@@ -4,7 +4,9 @@ import (
 	"errors"
 	"time"
 
-	"github.com/chemanyu/workspace/meishu/dmp_distribution/core"
+	"dmp_distribution/common"
+	"dmp_distribution/core"
+
 	"github.com/go-sql-driver/mysql"
 	"github.com/jinzhu/gorm"
 )
@@ -53,11 +55,11 @@ func init() {
 	}
 
 	dsn := mysql.Config{
-		Addr:                 config.GetValue("database", "server_address"),
-		User:                 config.GetValue("database", "user_name"),
-		Passwd:               config.GetValue("database", "password"),
+		Addr:                 common.GetValue("database", "server_address"),
+		User:                 common.GetValue("database", "user_name"),
+		Passwd:               common.GetValue("database", "password"),
 		Net:                  "tcp",
-		DBName:               config.GetValue("database", "db_name"),
+		DBName:               common.GetValue("database", "db_name"),
 		Params:               map[string]string{"charset": "utf8", "parseTime": "true", "loc": "Asia/Shanghai"},
 		Timeout:              time.Duration(5 * time.Second),
 		AllowNativePasswords: true,
