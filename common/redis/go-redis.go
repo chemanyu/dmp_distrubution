@@ -19,7 +19,7 @@ var redisAddrs = core.GetConfig().REDIS_POOL_DB
 
 type Mate struct {
 	lruData   *lru.Cache
-	redisPool *redis.ClusterClient // 使用 Redis 集群客户端
+	RedisPool *redis.ClusterClient // 使用 Redis 集群客户端
 	pushLock  *sync.RWMutex
 }
 
@@ -35,14 +35,14 @@ func NewData(msPool *sql.DB) *Mate {
 		PoolTimeout:     1 * time.Minute,        // 当所有连接都忙时的等待超时时间
 		ConnMaxLifetime: 30 * time.Minute,       // 连接生存时间
 		PoolFIFO:        true,
-		//IdleTimeout:     5 * time.Minute, // 空闲连接在被关闭之前的保持时间
+		//IdleTimeout:    5 * time.Minute, // 空闲连接在被关闭之前的保持时间
 	}
 
 	rdb := redis.NewClusterClient(clusterOptions)
 
 	return &Mate{
 		lruData:   lru.New(100000), // 使用 LRU 缓存
-		redisPool: rdb,             // 替换为 Redis 集群客户端
+		RedisPool: rdb,             // 替换为 Redis 集群客户端
 	}
 }
 

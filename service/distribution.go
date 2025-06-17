@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/context"
 
 	"dmp_distribution/module"
@@ -29,7 +29,7 @@ const (
 
 type DistributionService struct {
 	distModel *module.Distribution
-	rdb       *redis.Client
+	rdb       *redis.ClusterClient
 	ctx       context.Context
 	cancel    context.CancelFunc // 用于取消上下文
 	taskChan  chan *module.Distribution
@@ -37,7 +37,7 @@ type DistributionService struct {
 	isRunning bool // 用于标记服务是否在运行
 }
 
-func NewDistributionService(model *module.Distribution, rdb *redis.Client) *DistributionService {
+func NewDistributionService(model *module.Distribution, rdb *redis.ClusterClient) *DistributionService {
 	ctx, cancel := context.WithCancel(context.Background())
 	srv := &DistributionService{
 		distModel: model,

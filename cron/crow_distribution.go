@@ -45,7 +45,7 @@ func setupDistributionJobs() {
 		rdb := redis.NewData(nil)
 
 		// 初始化分发服务
-		distributionSvc = service.NewDistributionService(&module.Distribution{}, rdb)
+		distributionSvc = service.NewDistributionService(&module.Distribution{}, rdb.RedisPool)
 
 		// 启动任务调度器
 		distributionSvc.StartTaskScheduler()

@@ -4,6 +4,7 @@ import (
 	"context"
 	mysqldb "dmp_distribution/common/mysql"
 	"dmp_distribution/core"
+	"dmp_distribution/cron"
 	handlers "dmp_distribution/handler"
 	"log"
 	"net/http"
@@ -51,9 +52,8 @@ func init() {
 
 	// 加载配置文件
 	config = core.LoadConfig(*cfg)
-
 	mysqldb.InitMysql()
-
+	cron.InitCronJobs()
 }
 
 func MainControl() {
