@@ -1,5 +1,9 @@
 package module
 
+import (
+	mysqldb "dmp_distribution/common/mysql"
+)
+
 // Distribution 人群包分发任务表
 type Distribution struct {
 	ID         int    `gorm:"column:id;primaryKey;autoIncrement"`
@@ -29,16 +33,35 @@ var (
 
 // List 获取分发任务列表
 func (m *Distribution) List(query map[string]interface{}, page, pageSize int) ([]Distribution, int, error) {
+	db := mysqldb.GetConnected()
 	records := []Distribution{}
-	db := DbInstance.Debug()
 
-	db.Find(&records)
-	return records, len(records), nil
+	// 动态条件
+	queryDB := db.Model(&Distribution{})
+	if strategyID, ok := query["strategy_id"]; ok {
+		queryDB = queryDB.Where("strategy_id = ?", strategyID)
+	}
+	if status, ok := query["status"]; ok {
+		queryDB = queryDB.Where("status = ?", status)
+	}
+	// 其他条件...
+
+	// 分页
+	if page > 0 && pageSize > 0 {
+		queryDB = queryDB.Offset((page - 1) * pageSize).Limit(pageSize)
+
+	}
+	var total int64
+	queryDB.Count(&total)
+	err := queryDB.Find(&records).Error
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return records, int(total), nil
 }
 
 func (d *Distribution) UpdateStatus(id int, status int) error {
-	// TODO: Implement the logic to update the status in the database.
-	// For example, using GORM:
-	// return db.Model(&Distribution{}).Where("id = ?", id).Update("status", status).Error
-	return nil
+	db := mysqldb.GetConnected()
+	return db.Model(&Distribution{}).Where("id = ?", id).Update("status", status).Error
 }
