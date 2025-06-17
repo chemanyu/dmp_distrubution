@@ -1,4 +1,4 @@
-package crc32_pool
+package redis
 
 import (
 	"errors"

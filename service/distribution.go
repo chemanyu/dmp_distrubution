@@ -31,35 +31,74 @@ type DistributionService struct {
 	distModel *module.Distribution
 	rdb       *redis.Client
 	ctx       context.Context
+	cancel    context.CancelFunc // 用于取消上下文
 	taskChan  chan *module.Distribution
 	wg        sync.WaitGroup
+	isRunning bool // 用于标记服务是否在运行
 }
 
 func NewDistributionService(model *module.Distribution, rdb *redis.Client) *DistributionService {
+	ctx, cancel := context.WithCancel(context.Background())
 	srv := &DistributionService{
 		distModel: model,
 		rdb:       rdb,
-		ctx:       context.Background(),
+		ctx:       ctx,
+		cancel:    cancel,
 		taskChan:  make(chan *module.Distribution, 100),
+		isRunning: true,
 	}
 	// 启动任务处理器
 	go srv.taskProcessor()
 	return srv
 }
 
+// Stop 优雅地停止服务
+func (s *DistributionService) Stop() {
+	if !s.isRunning {
+		return
+	}
+	s.isRunning = false
+
+	// 取消上下文
+	if s.cancel != nil {
+		s.cancel()
+	}
+
+	// 关闭任务通道
+	close(s.taskChan)
+
+	// 等待所有任务完成
+	s.wg.Wait()
+
+	// 关闭Redis连接
+	if s.rdb != nil {
+		_ = s.rdb.Close()
+	}
+}
+
 // StartTaskScheduler 启动任务调度器
 func (s *DistributionService) StartTaskScheduler() {
 	ticker := time.NewTicker(time.Minute)
-	for range ticker.C {
-		tasks, _, err := s.distModel.List(map[string]interface{}{
-			"status": TaskWaitStatus,
-		}, 1, 100)
-		if err != nil {
-			continue
-		}
+	defer ticker.Stop()
 
-		for _, task := range tasks {
-			s.taskChan <- &task
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			if !s.isRunning {
+				return
+			}
+			tasks, _, err := s.distModel.List(map[string]interface{}{
+				"status": TaskWaitStatus,
+			}, 1, 100)
+			if err != nil {
+				continue
+			}
+
+			for _, task := range tasks {
+				s.taskChan <- &task
+			}
 		}
 	}
 }
