@@ -6,11 +6,10 @@ import (
 	"time"
 
 	"dmp_distribution/common/redis"
-
-	"github.com/robfig/cron/v3"
-
 	"dmp_distribution/module"
 	"dmp_distribution/service"
+
+	"github.com/robfig/cron/v3"
 )
 
 var (
@@ -25,18 +24,23 @@ func InitCronJobs() {
 		cronInstance = cron.New(cron.WithSeconds())
 		setupDistributionJobs()
 		cronInstance.Start()
+		log.Printf("[Cron] Cron jobs initialized and started")
 	})
 }
 
 // setupDistributionJobs 配置所有与分发相关的定时任务
 func setupDistributionJobs() {
 	// 添加分发任务，每5分钟执行一次
-
-	// 你可以根据需要调整 cron 表达式
 	_, err := cronInstance.AddFunc("0 */5 * * * *", func() {
 		log.Printf("[Cron] Starting distribution job at %v", time.Now().Format("2006-01-02 15:04:05"))
 
-		// 如果服务已经在运行，先停止它
+		// 如果服务已经在运行，不需要重新创建
+		if distributionSvc != nil && distributionSvc.IsRunning() {
+			log.Printf("[Cron] Distribution service is already running")
+			return
+		}
+
+		// 停止现有服务（如果有）
 		if distributionSvc != nil {
 			distributionSvc.Stop()
 		}
@@ -44,11 +48,11 @@ func setupDistributionJobs() {
 		// 初始化 Redis 客户端
 		rdb := redis.NewData(nil)
 
-		// 初始化分发服务
+		// 创建分发服务实例
 		distributionSvc = service.NewDistributionService(&module.Distribution{}, rdb.RedisPool)
 
-		// 启动任务调度器
-		distributionSvc.StartTaskScheduler()
+		// 启动任务调度器（会在后台持续运行）
+		go distributionSvc.StartTaskScheduler()
 
 		log.Printf("[Cron] Distribution service started successfully")
 	})
@@ -61,13 +65,14 @@ func setupDistributionJobs() {
 // StopCronJobs 停止所有正在运行的定时任务
 func StopCronJobs() {
 	if cronInstance != nil {
+		// 先停止定时任务
 		cronInstance.Stop()
+		log.Printf("[Cron] Cron scheduler stopped")
 
-		// 停止分发服务
+		// 再停止分发服务
 		if distributionSvc != nil {
 			distributionSvc.Stop()
+			log.Printf("[Cron] Distribution service stopped")
 		}
-
-		log.Printf("[Cron] All cron jobs and services stopped")
 	}
 }

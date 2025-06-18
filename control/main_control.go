@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	mysqldb "dmp_distribution/common/mysql"
+	redis "dmp_distribution/common/redis"
 	"dmp_distribution/core"
 	"dmp_distribution/cron"
 	handlers "dmp_distribution/handler"
@@ -53,6 +54,7 @@ func init() {
 	// 加载配置文件
 	config = core.LoadConfig(*cfg)
 	mysqldb.InitMysql()
+	redis.C32_Redis_Pools.Init_RedisPool(core.GetConfig().REDIS_POOL_DB)
 	cron.InitCronJobs()
 }
 

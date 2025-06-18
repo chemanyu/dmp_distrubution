@@ -19,29 +19,31 @@ import (
 const (
 	TaskQueueKey       = "dmp:distribution:task:queue"
 	TaskStatusKey      = "dmp:distribution:task:status:%d"
-	TaskProgressKey    = "dmp:distribution:task:progress:%d" // 新增进度跟踪
+	TaskProgressKey    = "dmp:distribution:task:progress:%d"
 	RetryMaxTimes      = 3
-	StreamBatchSize    = 1000 // 流式处理批次大小
-	MaxParallelWorkers = 10   // 最大并行工作协程
-	RedisBatchSize     = 500  // Redis批量操作大小
+	StreamBatchSize    = 1000
+	MaxParallelWorkers = 10
+	RedisBatchSize     = 500
 	TaskWaitStatus     = 0
 	TaskRunStatus      = 1
 	TaskDoneStatus     = 2
 	TaskFailStatus     = 3
 )
 
+// DistributionService 分发服务
 type DistributionService struct {
 	distModel      *module.Distribution
 	rdb            *redis.ClusterClient
 	ctx            context.Context
 	cancel         context.CancelFunc
 	taskChan       chan *module.Distribution
-	workerSem      chan struct{} // 工作协程信号量
+	workerSem      chan struct{}
 	wg             sync.WaitGroup
 	isRunning      bool
-	progressTicker *time.Ticker // 进度保存定时器
+	progressTicker *time.Ticker
 }
 
+// NewDistributionService 创建新的分发服务
 func NewDistributionService(model *module.Distribution, rdb *redis.ClusterClient) *DistributionService {
 	ctx, cancel := context.WithCancel(context.Background())
 	srv := &DistributionService{
@@ -54,11 +56,133 @@ func NewDistributionService(model *module.Distribution, rdb *redis.ClusterClient
 		isRunning:      true,
 		progressTicker: time.NewTicker(10 * time.Second),
 	}
-	go srv.progressPersister() // 启动进度持久化协程
+
+	// 启动必要的后台任务
+	go srv.progressPersister()
+	go srv.taskProcessor()
+
 	return srv
 }
 
-// processTask 改造后的任务处理方法
+// taskProcessor 处理从任务通道接收到的任务
+func (s *DistributionService) taskProcessor() {
+	log.Printf("Task processor started")
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Printf("Task processor stopped: context cancelled")
+			return
+		case task, ok := <-s.taskChan:
+			if !ok {
+				log.Printf("Task processor stopped: channel closed")
+				return
+			}
+
+			// 获取工作协程信号量
+			s.workerSem <- struct{}{}
+
+			s.wg.Add(1)
+			go func(t *module.Distribution) {
+				defer s.wg.Done()
+				defer func() { <-s.workerSem }() // 释放工作协程信号量
+
+				startTime := time.Now()
+				log.Printf("Processing task %d started", t.ID)
+
+				if err := s.processTask(t); err != nil {
+					log.Printf("Task %d failed after %v: %v", t.ID, time.Since(startTime), err)
+					s.finalizeTask(t, TaskFailStatus, err)
+				} else {
+					log.Printf("Task %d completed successfully in %v", t.ID, time.Since(startTime))
+					s.finalizeTask(t, TaskDoneStatus, nil)
+				}
+			}(task)
+		}
+	}
+}
+
+// IsRunning 返回服务是否正在运行
+func (s *DistributionService) IsRunning() bool {
+	return s.isRunning
+}
+
+// Stop 停止服务
+func (s *DistributionService) Stop() {
+	if !s.isRunning {
+		return
+	}
+	s.isRunning = false
+
+	if s.cancel != nil {
+		s.cancel()
+	}
+
+	close(s.taskChan)
+	s.wg.Wait()
+
+	if s.progressTicker != nil {
+		s.progressTicker.Stop()
+	}
+
+	log.Printf("Distribution service stopped gracefully")
+}
+
+// StartTaskScheduler 启动任务调度器
+func (s *DistributionService) StartTaskScheduler() {
+	log.Printf("Starting task scheduler")
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Printf("Task scheduler stopped: context cancelled")
+			return
+		case <-ticker.C:
+			if !s.isRunning {
+				log.Printf("Task scheduler stopped: service not running")
+				return
+			}
+
+			// 每次查询最多100个待处理任务
+			tasks, _, err := s.distModel.List(map[string]interface{}{
+				"status": TaskWaitStatus,
+			}, 1, 100)
+			if err != nil {
+				log.Printf("List tasks error: %v", err)
+				continue
+			}
+
+			for _, task := range tasks {
+				select {
+				case <-s.ctx.Done():
+					return
+				case s.taskChan <- &task:
+					log.Printf("Scheduled task %d for processing", task.ID)
+				default:
+					log.Printf("Task channel full, skipping task %d", task.ID)
+				}
+			}
+		}
+	}
+}
+
+// progressPersister 定期持久化进度
+func (s *DistributionService) progressPersister() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.progressTicker.C:
+			if !s.isRunning {
+				return
+			}
+			// 这里可以实现进度持久化逻辑
+		}
+	}
+}
+
+// processTask 处理单个任务
 func (s *DistributionService) processTask(task *module.Distribution) error {
 	// 1. 初始化任务状态
 	if err := s.initTaskStatus(task); err != nil {
@@ -219,16 +343,6 @@ func (s *DistributionService) finalizeTask(task *module.Distribution, status int
 // updateProgress 更新进度
 func (s *DistributionService) updateProgress(taskID int, processed int) {
 	s.rdb.Set(s.ctx, fmt.Sprintf(TaskProgressKey, taskID), processed, 0)
-}
-
-// progressPersister 定期持久化进度到DB
-func (s *DistributionService) progressPersister() {
-	for range s.progressTicker.C {
-		if !s.isRunning {
-			return
-		}
-		// 获取所有运行中任务并保存进度
-	}
 }
 
 func (s *DistributionService) cleanIMEI(imei string) string {

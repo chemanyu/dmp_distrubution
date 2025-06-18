@@ -2,7 +2,6 @@ package redis
 
 import (
 	"errors"
-	"log"
 
 	//"fmt"
 	"hash/crc32"
@@ -216,38 +215,4 @@ func (r *Crc32_RedisPool) GetHash_KeyData_Redis(key, field string) (string, erro
 func (r *Crc32_RedisPool) getkey(key string) int {
 	c32 := crc32.ChecksumIEEE([]byte(key))
 	return int(c32 % uint32(len(r.Ip_ports)))
-}
-
-func PushToRedisNew(device string, crowdId string) {
-	hour := time.Now().Hour()
-	ehour := 24 - hour
-	eday := 1
-	oaidmd5 := StrMd5(device)
-	keyName := "crowd_" + oaidmd5
-
-	exdate := time.Now().AddDate(0, 0, +1).Format("2006-01-02")
-	layout := "2006-01-02"
-	specifiedDate, err := time.Parse(layout, exdate)
-	if err != nil {
-		log.Println("日期解析错误:", err)
-		return
-	}
-
-	expirationTime := specifiedDate.AddDate(0, 0, eday)
-	expirationInMinutes := int(expirationTime.Sub(specifiedDate).Seconds())
-	fieldsAndValues := map[string]interface{}{
-		crowdId: time.Now().Unix() + 3600*int64(ehour),
-	}
-
-	// Assuming crc32_redis is a global redis pool instance
-	resultText, err = crc32_redis.C32_Redis_Pools.MSetHash_KeyData_Redis(keyName, fieldsAndValues)
-	if err != nil {
-		log.Println("Failed to set hash data in Redis:", err)
-	}
-	log.Println(resultText)
-	err = crc32_redis.C32_Redis_Pools.Expire(keyName, expirationInMinutes)
-	if err != nil {
-		log.Println("Failed to set expiration in Redis:", err)
-	}
-	return
 }
