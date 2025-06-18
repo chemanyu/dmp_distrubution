@@ -6,6 +6,6 @@ import (
 
 type Adn struct{}
 
-func (a *Adn) Distribution(task *module.Distribution, batches [][]map[string]string) error {
+func (a *Adn) Distribution(task *module.Distribution, batches []map[string]string) error {
 	return nil
 }

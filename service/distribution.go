@@ -2,6 +2,7 @@ package service
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -9,199 +10,227 @@ import (
 	"sync"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-	"golang.org/x/net/context"
-
 	"dmp_distribution/module"
 	"dmp_distribution/platform"
+
+	"github.com/redis/go-redis/v9"
 )
 
 const (
-	TaskQueueKey   = "dmp:distribution:task:queue"
-	TaskStatusKey  = "dmp:distribution:task:status:%d"
-	RetryMaxTimes  = 3
-	BatchSize      = 100000 // 单次处理的最大数据量
-	TaskWaitStatus = 0
-	TaskRunStatus  = 1
-	TaskDoneStatus = 2
-	TaskFailStatus = 3
+	TaskQueueKey       = "dmp:distribution:task:queue"
+	TaskStatusKey      = "dmp:distribution:task:status:%d"
+	TaskProgressKey    = "dmp:distribution:task:progress:%d" // 新增进度跟踪
+	RetryMaxTimes      = 3
+	StreamBatchSize    = 1000 // 流式处理批次大小
+	MaxParallelWorkers = 10   // 最大并行工作协程
+	RedisBatchSize     = 500  // Redis批量操作大小
+	TaskWaitStatus     = 0
+	TaskRunStatus      = 1
+	TaskDoneStatus     = 2
+	TaskFailStatus     = 3
 )
 
 type DistributionService struct {
-	distModel *module.Distribution
-	rdb       *redis.ClusterClient
-	ctx       context.Context
-	cancel    context.CancelFunc // 用于取消上下文
-	taskChan  chan *module.Distribution
-	wg        sync.WaitGroup
-	isRunning bool // 用于标记服务是否在运行
+	distModel      *module.Distribution
+	rdb            *redis.ClusterClient
+	ctx            context.Context
+	cancel         context.CancelFunc
+	taskChan       chan *module.Distribution
+	workerSem      chan struct{} // 工作协程信号量
+	wg             sync.WaitGroup
+	isRunning      bool
+	progressTicker *time.Ticker // 进度保存定时器
 }
 
 func NewDistributionService(model *module.Distribution, rdb *redis.ClusterClient) *DistributionService {
 	ctx, cancel := context.WithCancel(context.Background())
 	srv := &DistributionService{
-		distModel: model,
-		rdb:       rdb,
-		ctx:       ctx,
-		cancel:    cancel,
-		taskChan:  make(chan *module.Distribution, 100),
-		isRunning: true,
+		distModel:      model,
+		rdb:            rdb,
+		ctx:            ctx,
+		cancel:         cancel,
+		taskChan:       make(chan *module.Distribution, 100),
+		workerSem:      make(chan struct{}, MaxParallelWorkers),
+		isRunning:      true,
+		progressTicker: time.NewTicker(10 * time.Second),
 	}
-	// 启动任务处理器
-	go srv.taskProcessor()
+	go srv.progressPersister() // 启动进度持久化协程
 	return srv
 }
 
-// Stop 优雅地停止服务
-func (s *DistributionService) Stop() {
-	if !s.isRunning {
-		return
-	}
-	s.isRunning = false
-
-	// 取消上下文
-	if s.cancel != nil {
-		s.cancel()
-	}
-
-	// 关闭任务通道
-	close(s.taskChan)
-
-	// 等待所有任务完成
-	s.wg.Wait()
-
-	// 关闭Redis连接
-	if s.rdb != nil {
-		_ = s.rdb.Close()
-	}
-}
-
-// StartTaskScheduler 启动任务调度器
-func (s *DistributionService) StartTaskScheduler() {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-ticker.C:
-			if !s.isRunning {
-				return
-			}
-			tasks, _, err := s.distModel.List(map[string]interface{}{
-				"status": TaskWaitStatus,
-			}, 1, 100)
-			if err != nil {
-				continue
-			}
-
-			for _, task := range tasks {
-				s.taskChan <- &task
-			}
-		}
-	}
-}
-
-// taskProcessor 任务处理器
-func (s *DistributionService) taskProcessor() {
-	for task := range s.taskChan {
-		s.wg.Add(1)
-		go func(t *module.Distribution) {
-			defer s.wg.Done()
-			err := s.processTask(t)
-			if err != nil {
-				// 更新任务状态为失败
-				log.Printf("task %d failed: %v", t.ID, err)
-				s.distModel.UpdateStatus(t.ID, TaskFailStatus)
-			}
-		}(task)
-	}
-}
-
-// processTask 处理单个任务
+// processTask 改造后的任务处理方法
 func (s *DistributionService) processTask(task *module.Distribution) error {
-	// 更新任务状态为执行中
-	if err := s.distModel.UpdateStatus(task.ID, TaskRunStatus); err != nil {
-		return fmt.Errorf("update task status error: %v", err)
+	// 1. 初始化任务状态
+	if err := s.initTaskStatus(task); err != nil {
+		return err
 	}
 
-	// 1. 读取源文件数据
-	data, err := s.readSourceFile(task.Path, task)
-	if err != nil {
-		return fmt.Errorf("read source file error: %v", err)
+	// 2. 流式处理文件
+	processor := func(batch []map[string]string) error {
+		return s.processBatch(task, batch)
 	}
 
-	// 2. 数据分片
-	batches := s.splitDataIntoBatches(data, BatchSize)
-
-	// TODO: 调用内部平台API
-	platformServers, _ := platform.Servers.Get(task.Platform)
-	defer func() {
-		platform.Servers.Put(task.Platform, platformServers)
-	}()
-
-	// 处理平台服务器
-	if platformServers == nil {
-		return fmt.Errorf("no platform servers available for platform: %s", task.Platform)
+	if err := s.streamProcessFile(task, processor); err != nil {
+		s.finalizeTask(task, TaskFailStatus, err)
+		return err
 	}
 
-	err = platformServers.Distribution(task, batches)
-	if err != nil {
-		return fmt.Errorf("distribution to platform error: %v", err)
-	}
-
-	// 更新任务状态为完成
-	return s.distModel.UpdateStatus(task.ID, TaskDoneStatus)
+	// 3. 最终状态更新
+	return s.finalizeTask(task, TaskDoneStatus, nil)
 }
 
-// readSourceFile 读取源文件并进行数据清洗
-func (s *DistributionService) readSourceFile(path string, task *module.Distribution) ([]map[string]string, error) {
-	file, err := os.Open(path)
+// streamProcessFile 流式处理大文件
+func (s *DistributionService) streamProcessFile(task *module.Distribution, processor func([]map[string]string) error) error {
+
+	file, err := os.Open(task.Path)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("open file error: %w", err)
 	}
 	defer file.Close()
 
-	var data []map[string]string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		deviceInfo := make(map[string]string)
+	var (
+		scanner   = bufio.NewScanner(file)
+		batch     = make([]map[string]string, 0, StreamBatchSize)
+		lineCount int
+	)
 
-		// 解析行数据（假设是CSV格式）
-		fields := strings.Split(line, ",")
-		if len(fields) == 0 {
+	for scanner.Scan() {
+		if !s.isRunning {
+			return fmt.Errorf("service stopped")
+		}
+
+		deviceInfo, valid := s.parseLine(scanner.Text(), task)
+		if !valid {
 			continue
 		}
 
-		// 根据启用的字段提取数据
-		if task.Imei == 1 {
-			if imei := s.cleanIMEI(fields[0]); imei != "" {
-				deviceInfo["imei"] = imei
-			}
-		}
-		if task.Oaid == 1 {
-			if oaid := s.cleanOAID(fields[1]); oaid != "" {
-				deviceInfo["oaid"] = oaid
-			}
-		}
-		if task.Idfa == 1 {
-			if idfa := s.cleanIDFA(fields[2]); idfa != "" {
-				deviceInfo["idfa"] = idfa
-			}
-		}
-		// ... 处理其他字段
+		batch = append(batch, deviceInfo)
+		lineCount++
 
-		if len(deviceInfo) > 0 {
-			data = append(data, deviceInfo)
+		// 批次处理
+		if len(batch) >= StreamBatchSize {
+			if err := processor(batch); err != nil {
+				return err
+			}
+			batch = batch[:0] // 清空批次
+			s.updateProgress(task.ID, lineCount)
 		}
 	}
 
-	return data, scanner.Err()
+	// 处理剩余数据
+	if len(batch) > 0 {
+		if err := processor(batch); err != nil {
+			return err
+		}
+		s.updateProgress(task.ID, lineCount)
+	}
+
+	return scanner.Err()
 }
 
-// cleanIMEI 清洗IMEI数据
+// processBatch 处理单个批次
+func (s *DistributionService) processBatch(task *module.Distribution, batch []map[string]string) error {
+	platformServers, err := platform.Servers.Get(task.Platform)
+	if err != nil {
+		return fmt.Errorf("get platform servers error: %w", err)
+	}
+	defer platform.Servers.Put(task.Platform, platformServers)
+
+	// 分批提交到Redis
+	for i := 0; i < len(batch); i += RedisBatchSize {
+		end := i + RedisBatchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+
+		retry := 0
+		for retry <= RetryMaxTimes {
+			if err := platformServers.Distribution(task, batch[i:end]); err == nil {
+				break
+			}
+			retry++
+			time.Sleep(time.Second * time.Duration(retry))
+		}
+
+		if retry > RetryMaxTimes {
+			return fmt.Errorf("max retries exceeded for batch %d-%d", i, end)
+		}
+	}
+	return nil
+}
+
+// ========== 辅助方法 ========== //
+
+// parseLine 优化后的行解析
+func (s *DistributionService) parseLine(line string, task *module.Distribution) (map[string]string, bool) {
+	fields := strings.Split(line, ",")
+	if len(fields) == 0 {
+		return nil, false
+	}
+
+	deviceInfo := make(map[string]string)
+	if task.Imei == 1 && len(fields) > 0 {
+		if imei := s.cleanIMEI(fields[0]); imei != "" {
+			deviceInfo["imei"] = imei
+		}
+	}
+	// 其他字段处理...
+	if task.Oaid == 1 && len(fields) > 1 {
+		if oaid := s.cleanOAID(fields[1]); oaid != "" {
+			deviceInfo["oaid"] = oaid
+		}
+	}
+	if task.Idfa == 1 && len(fields) > 2 {
+		if idfa := s.cleanIDFA(fields[2]); idfa != "" {
+			deviceInfo["idfa"] = idfa
+		}
+	}
+	if task.Caid == 1 && len(fields) > 3 {
+		deviceInfo["caid"] = fields[3]
+	}
+	if task.Caid2 == 1 && len(fields) > 4 {
+		deviceInfo["caid2"] = fields[4]
+	}
+	if task.UserID == 1 && len(fields) > 5 {
+		deviceInfo["user_id"] = fields[5]
+	}
+
+	return deviceInfo, len(deviceInfo) > 0
+}
+
+// initTaskStatus 任务初始化
+func (s *DistributionService) initTaskStatus(task *module.Distribution) error {
+	if err := s.distModel.UpdateStatus(task.ID, TaskRunStatus); err != nil {
+		return fmt.Errorf("update status error: %w", err)
+	}
+	s.rdb.Set(s.ctx, fmt.Sprintf(TaskProgressKey, task.ID), "0", 0)
+	return nil
+}
+
+// finalizeTask 任务收尾
+func (s *DistributionService) finalizeTask(task *module.Distribution, status int, err error) error {
+	if status == TaskFailStatus {
+		log.Printf("Task %d failed: %v", task.ID, err)
+	}
+	s.rdb.Del(s.ctx, fmt.Sprintf(TaskProgressKey, task.ID))
+	return s.distModel.UpdateStatus(task.ID, status)
+}
+
+// updateProgress 更新进度
+func (s *DistributionService) updateProgress(taskID int, processed int) {
+	s.rdb.Set(s.ctx, fmt.Sprintf(TaskProgressKey, taskID), processed, 0)
+}
+
+// progressPersister 定期持久化进度到DB
+func (s *DistributionService) progressPersister() {
+	for range s.progressTicker.C {
+		if !s.isRunning {
+			return
+		}
+		// 获取所有运行中任务并保存进度
+	}
+}
+
 func (s *DistributionService) cleanIMEI(imei string) string {
 	// 去除空格和特殊字符
 	imei = strings.TrimSpace(imei)
@@ -232,17 +261,4 @@ func (s *DistributionService) cleanIDFA(idfa string) string {
 		return ""
 	}
 	return idfa
-}
-
-// splitDataIntoBatches 将数据分片
-func (s *DistributionService) splitDataIntoBatches(data []map[string]string, batchSize int) [][]map[string]string {
-	var batches [][]map[string]string
-	for i := 0; i < len(data); i += batchSize {
-		end := i + batchSize
-		if end > len(data) {
-			end = len(data)
-		}
-		batches = append(batches, data[i:end])
-	}
-	return batches
 }

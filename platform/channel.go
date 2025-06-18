@@ -11,7 +11,7 @@ import (
 )
 
 type Platform interface {
-	Distribution(task *module.Distribution, batches [][]map[string]string) error //接受回调事件AcceptTrack ocpx
+	Distribution(task *module.Distribution, batches []map[string]string) error //接受回调事件AcceptTrack ocpx
 }
 
 type TaskServerRegistry struct {
