@@ -2,9 +2,8 @@ package service
 
 import (
 	"bufio"
-	"encoding/csv"
-	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -14,6 +13,7 @@ import (
 	"golang.org/x/net/context"
 
 	"dmp_distribution/module"
+	"dmp_distribution/platform"
 )
 
 const (
@@ -112,6 +112,7 @@ func (s *DistributionService) taskProcessor() {
 			err := s.processTask(t)
 			if err != nil {
 				// 更新任务状态为失败
+				log.Printf("task %d failed: %v", t.ID, err)
 				s.distModel.UpdateStatus(t.ID, TaskFailStatus)
 			}
 		}(task)
@@ -134,20 +135,20 @@ func (s *DistributionService) processTask(task *module.Distribution) error {
 	// 2. 数据分片
 	batches := s.splitDataIntoBatches(data, BatchSize)
 
-	// 3. 根据不同类型执行分发
-	switch task.Type {
-	case 1: // 内部平台
-		err = s.distributeToInternalPlatform(task, batches)
-	case 2: // 外部平台
-		err = s.distributeToExternalPlatform(task, batches)
-	case 3: // 下载数据文件
-		err = s.generateDownloadFile(task, batches)
-	default:
-		err = fmt.Errorf("unknown distribution type: %d", task.Type)
+	// TODO: 调用内部平台API
+	platformServers, _ := platform.Servers.Get(task.Platform)
+	defer func() {
+		platform.Servers.Put(task.Platform, platformServers)
+	}()
+
+	// 处理平台服务器
+	if platformServers == nil {
+		return fmt.Errorf("no platform servers available for platform: %s", task.Platform)
 	}
 
+	err = platformServers.Distribution(task, batches)
 	if err != nil {
-		return err
+		return fmt.Errorf("distribution to platform error: %v", err)
 	}
 
 	// 更新任务状态为完成
@@ -244,81 +245,4 @@ func (s *DistributionService) splitDataIntoBatches(data []map[string]string, bat
 		batches = append(batches, data[i:end])
 	}
 	return batches
-}
-
-// distributeToInternalPlatform 分发到内部平台
-func (s *DistributionService) distributeToInternalPlatform(task *module.Distribution, batches [][]map[string]string) error {
-	for _, batch := range batches {
-		// 转换为内部平台所需的格式
-		data, err := json.Marshal(batch)
-		if err != nil {
-			return err
-		}
-
-		// TODO: 调用内部平台API
-		// 这里需要根据实际的内部平台API实现具体的调用逻辑
-	}
-	return nil
-}
-
-// distributeToExternalPlatform 分发到外部平台
-func (s *DistributionService) distributeToExternalPlatform(task *module.Distribution, batches [][]map[string]string) error {
-	for i, batch := range batches {
-		retryCount := 0
-		for retryCount < RetryMaxTimes {
-			// 转换为外部平台所需的格式
-			data, err := json.Marshal(map[string]interface{}{
-				"task_id":  task.ID,
-				"batch_id": i,
-				"data":     batch,
-			})
-			if err != nil {
-				return err
-			}
-
-			// TODO: 调用外部平台API
-			// 这里需要根据实际的外部平台API实现具体的调用逻辑
-
-			retryCount++
-			time.Sleep(time.Second * time.Duration(1<<uint(retryCount))) // 指数退避
-		}
-	}
-	return nil
-}
-
-// generateDownloadFile 生成下载文件
-func (s *DistributionService) generateDownloadFile(task *module.Distribution, batches [][]map[string]string) error {
-	// 创建临时文件
-	tmpFile, err := os.CreateTemp("", fmt.Sprintf("dmp_distribution_%d_*.csv", task.ID))
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmpFile.Name())
-
-	writer := csv.NewWriter(tmpFile)
-	defer writer.Flush()
-
-	// 写入表头
-	headers := []string{"imei", "oaid", "idfa", "caid", "caid2", "user_id"}
-	if err := writer.Write(headers); err != nil {
-		return err
-	}
-
-	// 写入数据
-	for _, batch := range batches {
-		for _, item := range batch {
-			record := make([]string, len(headers))
-			for i, header := range headers {
-				record[i] = item[header]
-			}
-			if err := writer.Write(record); err != nil {
-				return err
-			}
-		}
-	}
-
-	// TODO: 上传文件到OSS或其他存储服务
-	// 这里需要根据实际的存储服务实现具体的上传逻辑
-
-	return nil
 }

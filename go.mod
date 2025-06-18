@@ -10,7 +10,6 @@ require (
 	github.com/garyburd/redigo v1.6.4
 	github.com/gin-contrib/pprof v1.5.3
 	github.com/gin-gonic/gin v1.10.0
-	github.com/go-redis/redis/v8 v8.11.5
 	github.com/go-sql-driver/mysql v1.9.2
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/google/uuid v1.6.0
@@ -26,7 +25,6 @@ require (
 	github.com/valyala/fasthttp v1.60.0
 	golang.org/x/net v0.38.0
 	golang.org/x/sync v0.13.0
-	gopkg.in/yaml.v2 v2.4.0
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/gorm v1.30.0
 )

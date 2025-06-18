@@ -1,4 +1,4 @@
-package ginprom
+package ginporm
 
 import (
 	"dmp_distribution/common"
