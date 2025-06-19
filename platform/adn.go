@@ -37,7 +37,7 @@ func (a *Adn) Distribution(task *module.Distribution, batches []map[string]strin
 
 	// 计算过期时间（秒）
 	expirationSeconds := int(expirationDate.Sub(now).Seconds())
-	crowdID := fmt.Sprintf("%d", task.ID)
+	crowdID := fmt.Sprintf("%d", task.Crowd)
 
 	// 批量处理所有设备
 	for _, device := range batches {

@@ -20,6 +20,7 @@ type Distribution struct {
 	Path       string `gorm:"column:path;size:128" json:"path"`           // 源文件地址
 	Status     int8   `gorm:"column:status;default:0" json:"status"`      // 0-等待中，1-执行中，2-已结束
 	CreateTime int64  `gorm:"column:create_time;not null" json:"create_time"`
+	IsDel      int8   `gorm:"column:is_del;not null;default:0" json:"is_del"` // 0-未删除，1-已删除
 }
 
 // TableName 指定表名
@@ -44,7 +45,7 @@ func (m *Distribution) List(query map[string]interface{}, page, pageSize int) ([
 	if status, ok := query["status"]; ok {
 		queryDB = queryDB.Where("status = ?", status)
 	}
-	// 其他条件...
+	queryDB = queryDB.Where("is_del = ?", 0) // 只查询未删除的记录
 
 	// 分页
 	if page > 0 && pageSize > 0 {
