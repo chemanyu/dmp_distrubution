@@ -9,6 +9,8 @@ import (
 
 	"dmp_distribution/common/redis"
 	"dmp_distribution/module"
+
+	redis_cluster "github.com/redis/go-redis/v9"
 )
 
 // Adn ADN平台实现
@@ -22,7 +24,7 @@ func StrMd5(str string) string {
 }
 
 // Distribution 实现批量数据分发到ADN平台
-func (a *Adn) Distribution(task *module.Distribution, batches []map[string]string) error {
+func (a *Adn) Distribution(rdb *redis_cluster.ClusterClient, task *module.Distribution, batches []map[string]string) error {
 	// 获取当前小时和剩余小时数
 	now := time.Now()
 	hour := now.Hour()

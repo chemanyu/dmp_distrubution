@@ -8,10 +8,12 @@ import (
 	"time"
 
 	ginprom "dmp_distribution/common/ginporm"
+
+	"github.com/redis/go-redis/v9"
 )
 
 type Platform interface {
-	Distribution(task *module.Distribution, batches []map[string]string) error //接受回调事件AcceptTrack ocpx
+	Distribution(rdb *redis.ClusterClient, task *module.Distribution, batches []map[string]string) error //接受回调事件AcceptTrack ocpx
 }
 
 type TaskServerRegistry struct {
@@ -139,4 +141,5 @@ var Servers = NewTaskServerRegistry()
 func init() {
 	// 你的初始化逻辑
 	Servers.Register("adn", 10, 1000, func() Platform { return &Adn{} }, 5*time.Second, 3*time.Second)
+	Servers.Register("ssp", 10, 1000, func() Platform { return &Ssp{} }, 5*time.Second, 3*time.Second)
 }

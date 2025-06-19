@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dmp_distribution/module"
@@ -17,10 +18,10 @@ import (
 )
 
 const (
-	TaskQueueKey       = "dmp:distribution:task:queue"
-	TaskStatusKey      = "dmp:distribution:task:status:%d"
-	TaskProgressKey    = "dmp:distribution:task:progress:%d"
-	RetryMaxTimes      = 3
+	// TaskQueueKey       = "dmp:distribution:task:queue"
+	// TaskStatusKey      = "dmp:distribution:task:status:%d"
+	// TaskProgressKey    = "dmp:distribution:task:progress:%d"
+	// RetryMaxTimes      = 3
 	StreamBatchSize    = 1000
 	MaxParallelWorkers = 10
 	RedisBatchSize     = 500
@@ -28,6 +29,10 @@ const (
 	TaskRunStatus      = 1
 	TaskDoneStatus     = 2
 	TaskFailStatus     = 3
+
+	// 进度更新相关常量
+	ProgressUpdateInterval = 20 * time.Second // 进度更新间隔
+	MinProgressDiff        = 10000            // 最小更新差异
 )
 
 // DistributionService 分发服务
@@ -41,6 +46,18 @@ type DistributionService struct {
 	wg             sync.WaitGroup
 	isRunning      bool
 	progressTicker *time.Ticker
+
+	// 进度追踪
+	progressMap    sync.Map          // 用于存储每个任务的进度
+	progressMutex  sync.RWMutex      // 用于保护进度更新
+	lastUpdateTime map[int]time.Time // 记录每个任务最后更新时间
+}
+
+// taskProgress 任务进度结构
+type taskProgress struct {
+	currentCount int64     // 当前处理行数
+	lastDBCount  int64     // 上次写入数据库的行数
+	lastUpdate   time.Time // 上次更新时间
 }
 
 // NewDistributionService 创建新的分发服务
@@ -54,7 +71,8 @@ func NewDistributionService(model *module.Distribution, rdb *redis.ClusterClient
 		taskChan:       make(chan *module.Distribution, 100),
 		workerSem:      make(chan struct{}, MaxParallelWorkers),
 		isRunning:      true,
-		progressTicker: time.NewTicker(10 * time.Second),
+		progressTicker: time.NewTicker(ProgressUpdateInterval),
+		lastUpdateTime: make(map[int]time.Time),
 	}
 
 	// 启动必要的后台任务
@@ -167,17 +185,18 @@ func (s *DistributionService) StartTaskScheduler() {
 	}
 }
 
-// progressPersister 定期持久化进度
+// progressPersister 定期将内存中的进度持久化到数据库
 func (s *DistributionService) progressPersister() {
 	for {
 		select {
 		case <-s.ctx.Done():
+			s.flushAllProgress() // 服务停止时，确保刷新所有进度
 			return
 		case <-s.progressTicker.C:
 			if !s.isRunning {
 				return
 			}
-			// 这里可以实现进度持久化逻辑
+			s.flushProgress()
 		}
 	}
 }
@@ -205,7 +224,6 @@ func (s *DistributionService) processTask(task *module.Distribution) error {
 
 // streamProcessFile 流式处理大文件
 func (s *DistributionService) streamProcessFile(task *module.Distribution, processor func([]map[string]string) error) error {
-
 	file, err := os.Open(task.Path)
 	if err != nil {
 		return fmt.Errorf("open file error: %w", err)
@@ -215,8 +233,13 @@ func (s *DistributionService) streamProcessFile(task *module.Distribution, proce
 	var (
 		scanner   = bufio.NewScanner(file)
 		batch     = make([]map[string]string, 0, StreamBatchSize)
-		lineCount int
+		batchSize int64
 	)
+
+	// 初始化进度记录
+	s.progressMap.Store(task.ID, &taskProgress{
+		lastUpdate: time.Now(),
+	})
 
 	for scanner.Scan() {
 		if !s.isRunning {
@@ -229,15 +252,16 @@ func (s *DistributionService) streamProcessFile(task *module.Distribution, proce
 		}
 
 		batch = append(batch, deviceInfo)
-		lineCount++
+		batchSize++
 
 		// 批次处理
 		if len(batch) >= StreamBatchSize {
 			if err := processor(batch); err != nil {
 				return err
 			}
+			s.updateProgress(task.ID, batchSize)
 			batch = batch[:0] // 清空批次
-			s.updateProgress(task.ID, lineCount)
+			batchSize = 0
 		}
 	}
 
@@ -246,8 +270,11 @@ func (s *DistributionService) streamProcessFile(task *module.Distribution, proce
 		if err := processor(batch); err != nil {
 			return err
 		}
-		s.updateProgress(task.ID, lineCount)
+		s.updateProgress(task.ID, batchSize)
 	}
+
+	// 确保最终进度被写入数据库
+	s.flushProgress()
 
 	return scanner.Err()
 }
@@ -269,7 +296,7 @@ func (s *DistributionService) processBatch(task *module.Distribution, batch []ma
 
 		retry := 0
 		for retry <= RetryMaxTimes {
-			if err := platformServers.Distribution(task, batch[i:end]); err == nil {
+			if err := platformServers.Distribution(s.rdb, task, batch[i:end]); err == nil {
 				break
 			}
 			retry++
@@ -282,8 +309,6 @@ func (s *DistributionService) processBatch(task *module.Distribution, batch []ma
 	}
 	return nil
 }
-
-// ========== 辅助方法 ========== //
 
 // parseLine 优化后的行解析
 func (s *DistributionService) parseLine(line string, task *module.Distribution) (map[string]string, bool) {
@@ -327,7 +352,10 @@ func (s *DistributionService) initTaskStatus(task *module.Distribution) error {
 	if err := s.distModel.UpdateStatus(task.ID, TaskRunStatus); err != nil {
 		return fmt.Errorf("update status error: %w", err)
 	}
-	s.rdb.Set(s.ctx, fmt.Sprintf(TaskProgressKey, task.ID), "0", 0)
+	// 初始化行数为0
+	if err := s.distModel.UpdateLineCount(task.ID, 0); err != nil {
+		return fmt.Errorf("init line count error: %w", err)
+	}
 	return nil
 }
 
@@ -336,13 +364,7 @@ func (s *DistributionService) finalizeTask(task *module.Distribution, status int
 	if status == TaskFailStatus {
 		log.Printf("Task %d failed: %v", task.ID, err)
 	}
-	s.rdb.Del(s.ctx, fmt.Sprintf(TaskProgressKey, task.ID))
 	return s.distModel.UpdateStatus(task.ID, status)
-}
-
-// updateProgress 更新进度
-func (s *DistributionService) updateProgress(taskID int, processed int) {
-	s.rdb.Set(s.ctx, fmt.Sprintf(TaskProgressKey, taskID), processed, 0)
 }
 
 func (s *DistributionService) cleanIMEI(imei string) string {
@@ -375,4 +397,59 @@ func (s *DistributionService) cleanIDFA(idfa string) string {
 		return ""
 	}
 	return idfa
+}
+
+// flushProgress 将内存中的进度刷新到数据库
+func (s *DistributionService) flushProgress() {
+	now := time.Now()
+
+	s.progressMap.Range(func(key, value interface{}) bool {
+		taskID := key.(int)
+		progress := value.(*taskProgress)
+
+		// 检查是否需要更新
+		currentCount := atomic.LoadInt64(&progress.currentCount)
+		lastDBCount := atomic.LoadInt64(&progress.lastDBCount)
+
+		// 只有当处理行数显著增加或距离上次更新时间较长时才更新
+		if currentCount-lastDBCount >= MinProgressDiff ||
+			now.Sub(progress.lastUpdate) >= ProgressUpdateInterval {
+
+			if err := s.distModel.UpdateLineCount(taskID, currentCount); err != nil {
+				log.Printf("Failed to update line count for task %d: %v", taskID, err)
+			} else {
+				atomic.StoreInt64(&progress.lastDBCount, currentCount)
+				progress.lastUpdate = now
+			}
+		}
+
+		return true
+	})
+}
+
+// flushAllProgress 刷新所有进度到数据库
+func (s *DistributionService) flushAllProgress() {
+	s.progressMap.Range(func(key, value interface{}) bool {
+		taskID := key.(int)
+		progress := value.(*taskProgress)
+
+		currentCount := atomic.LoadInt64(&progress.currentCount)
+		if err := s.distModel.UpdateLineCount(taskID, currentCount); err != nil {
+			log.Printf("Failed to flush final line count for task %d: %v", taskID, err)
+		}
+
+		return true
+	})
+}
+
+// updateProgress 更新处理进度（内存中）
+func (s *DistributionService) updateProgress(taskID int, delta int64) {
+	// 获取或创建进度记录
+	value, _ := s.progressMap.LoadOrStore(taskID, &taskProgress{
+		lastUpdate: time.Now(),
+	})
+	progress := value.(*taskProgress)
+
+	// 原子递增计数
+	atomic.AddInt64(&progress.currentCount, delta)
 }

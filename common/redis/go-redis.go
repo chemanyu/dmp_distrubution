@@ -59,7 +59,7 @@ func (c *Mate) lruGet(key string) (ret []byte) {
 
 func (c *Mate) RedisGet(key string) []byte {
 	ctx := context.Background() // 创建上下文
-	ret, err := c.redisPool.Get(ctx, key).Bytes()
+	ret, err := c.RedisPool.Get(ctx, key).Bytes()
 	if err != nil {
 		if err == redis.Nil { // key 不存在
 			return nil
@@ -79,7 +79,7 @@ func (c *Mate) RedisGet(key string) []byte {
 
 func (c *Mate) SetCaches(key string, value []byte) {
 	ctx := context.Background()                                      // 创建上下文
-	err := c.redisPool.Set(ctx, key, value, 86400*time.Second).Err() // 设置缓存并设置过期时间
+	err := c.RedisPool.Set(ctx, key, value, 86400*time.Second).Err() // 设置缓存并设置过期时间
 	if err != nil && gin.DebugMode == "debug" {
 		log.Println("SetCaches:", err.Error())
 	}
