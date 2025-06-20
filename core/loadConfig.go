@@ -2,6 +2,8 @@ package core
 
 import (
 	"fmt"
+	"log"
+	"path/filepath"
 
 	"github.com/spf13/viper"
 )
@@ -24,27 +26,33 @@ var config *Config
 
 // LoadConfig 从配置文件中读取配置项
 func LoadConfig(cfg string) *Config {
-	viper.SetConfigFile(cfg)
-	viper.ReadInConfig()
-	viper.AutomaticEnv()
-	config = &Config{
-		MYSQL_DB:          getViperStringValue("MYSQL_DB"),
-		DORIS_DB:          getViperStringValue("DORIS_DB"),
-		REDIS_DB:          getViperStringValue("REDIS_DB"),
-		REDIS_POOL_DB:     getViperStringValue("REDIS_POOL_DB"),
-		SERVER_PORT:       getViperStringValue("SERVER_PORT"),
-		SERVER_ADDRESS:    getViperStringValue("SERVER_ADDRESS"),
-		LOG_PATH:          getViperStringValue("LOG_PATH"),
-		SYSTEM_MODE:       getViperStringValue("SYSTEM_MODE"),       //release debug
-		CALLBACK_BASE_URL: getViperStringValue("CALLBACK_BASE_URL"), //release debug
-		PPROF:             getViperStringValue("PPROF"),             //release debug
 
+	absPath, _ := filepath.Abs(cfg)
+	// 配置viper
+	viper.SetConfigFile(absPath)
+	viper.SetConfigType("yaml") // 明确指定配置类型
+	viper.ReadInConfig()
+
+	config = &Config{
+		MYSQL_DB:      getViperStringValue("MYSQL_DB"),
+		DORIS_DB:      getViperStringValue("DORIS_DB"),
+		REDIS_DB:      getViperStringValue("REDIS_DB"),
+		REDIS_POOL_DB: getViperStringValue("REDIS_POOL_DB"),
+		// SERVER_PORT:       getViperStringValue("SERVER_PORT"),
+		// SERVER_ADDRESS:    getViperStringValue("SERVER_ADDRESS"),
+		// LOG_PATH:          getViperStringValue("LOG_PATH"),
+		// SYSTEM_MODE:       getViperStringValue("SYSTEM_MODE"),       //release debug
+		// CALLBACK_BASE_URL: getViperStringValue("CALLBACK_BASE_URL"), //release debug
+		// PPROF:             getViperStringValue("PPROF"),             //release debug
 	}
 	return config
 }
 
 // GetConfig 返回已经读取的配置项
 func GetConfig() *Config {
+	if config == nil {
+		panic("Config not initialized. Call LoadConfig first.")
+	}
 	return config
 }
 
@@ -52,6 +60,9 @@ func GetConfig() *Config {
 func getViperStringValue(key string) string {
 	value := viper.GetString(key)
 	if value == "" {
+		configFile := viper.ConfigFileUsed()
+		log.Printf("Failed to get value for key %s. Current config file: %s", key, configFile)
+		log.Printf("Available keys: %v", viper.AllKeys())
 		panic(fmt.Errorf("%s 必须在环境变量或 config.yaml 文件中提供", key))
 	}
 	return value

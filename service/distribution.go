@@ -21,7 +21,7 @@ const (
 	// TaskQueueKey       = "dmp:distribution:task:queue"
 	// TaskStatusKey      = "dmp:distribution:task:status:%d"
 	// TaskProgressKey    = "dmp:distribution:task:progress:%d"
-	// RetryMaxTimes      = 3
+	RetryMaxTimes      = 3
 	StreamBatchSize    = 1000
 	MaxParallelWorkers = 10
 	RedisBatchSize     = 500
@@ -31,8 +31,8 @@ const (
 	TaskFailStatus     = 3
 
 	// 进度更新相关常量
-	ProgressUpdateInterval = 20 * time.Second // 进度更新间隔
-	MinProgressDiff        = 10000            // 最小更新差异
+	ProgressUpdateInterval = 60 * time.Second // 进度更新间隔
+	MinProgressDiff        = 50000            // 最小更新差异
 )
 
 // DistributionService 分发服务

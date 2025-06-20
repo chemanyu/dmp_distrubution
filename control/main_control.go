@@ -42,11 +42,11 @@ var (
 
 // 初始化服务  绑定IP 端口
 func init() {
-	cfg := pflag.StringP("config", "c", "./etc/conf.yaml", "api server config file path.")
+	cfg := pflag.StringP("config", "c", "etc/config.yaml", "api server config file path.")
 	pflag.Parse()
 
 	DefaultHandlerBundle = &handlerBundle{
-		rootUrl:           "report",
+		rootUrl:           "dmp",
 		apiVer:            "v1",
 		handlerEntitySets: []*handlerEntity{},
 	}
@@ -54,7 +54,9 @@ func init() {
 	// 加载配置文件
 	config = core.LoadConfig(*cfg)
 	mysqldb.InitMysql()
-	redis.C32_Redis_Pools.Init_RedisPool(core.GetConfig().REDIS_POOL_DB)
+	redis.C32_Redis_Pools.Init_RedisPool(config.REDIS_POOL_DB)
+	// 初始化 Redis
+	redis.InitRedis(config.REDIS_POOL_DB)
 	cron.InitCronJobs()
 }
 

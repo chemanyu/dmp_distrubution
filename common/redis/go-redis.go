@@ -15,7 +15,15 @@ import (
 	"github.com/redis/go-redis/v9" // Redis 集群库
 )
 
-var redisAddrs = core.GetConfig().REDIS_POOL_DB
+var redisAddrs string
+
+func InitRedis(redisAddrs string) {
+	// 初始化 Redis 地址
+	redisAddrs = core.GetConfig().REDIS_POOL_DB
+	if redisAddrs == "" {
+		log.Fatal("REDIS_POOL_DB must be set in the configuration")
+	}
+}
 
 type Mate struct {
 	lruData   *lru.Cache
@@ -24,7 +32,6 @@ type Mate struct {
 }
 
 func NewData(msPool *sql.DB) *Mate {
-	redisAddrs := core.GetConfig().REDIS_POOL_DB
 	Ip_ports := strings.Split(redisAddrs, ",")
 	clusterOptions := &redis.ClusterOptions{
 		Addrs:           Ip_ports,
