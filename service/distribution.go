@@ -38,6 +38,7 @@ const (
 // DistributionService 分发服务
 type DistributionService struct {
 	distModel      *module.Distribution
+	crowdRule      *module.CrowdRule
 	rdb            *redis.ClusterClient
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -65,6 +66,7 @@ func NewDistributionService(model *module.Distribution, rdb *redis.ClusterClient
 	ctx, cancel := context.WithCancel(context.Background())
 	srv := &DistributionService{
 		distModel:      model,
+		crowdRule:      &module.CrowdRule{},
 		rdb:            rdb,
 		ctx:            ctx,
 		cancel:         cancel,
@@ -111,8 +113,8 @@ func (s *DistributionService) taskProcessor() {
 					log.Printf("Task %d failed after %v: %v", t.ID, time.Since(startTime), err)
 					s.finalizeTask(t, TaskFailStatus, err)
 				} else {
-					log.Printf("Task %d completed successfully in %v", t.ID, time.Since(startTime))
-					s.finalizeTask(t, TaskDoneStatus, nil)
+					log.Printf("Task %d completed successfully after %v", t.ID, time.Since(startTime))
+					s.distModel.UpdateExecTime(t.ID, time.Now().Unix())
 				}
 			}(task)
 		}
@@ -165,7 +167,7 @@ func (s *DistributionService) StartTaskScheduler() {
 			// 每次查询最多100个待处理任务
 			tasks, _, err := s.distModel.List(map[string]interface{}{
 				"status": TaskWaitStatus,
-			}, 1, 100)
+			}, 0, 0)
 			if err != nil {
 				log.Printf("List tasks error: %v", err)
 				continue

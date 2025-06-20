@@ -21,7 +21,8 @@ type Distribution struct {
 	Status     int8   `gorm:"column:status;default:0" json:"status"`         // 0-等待中，1-执行中，2-已结束
 	LineCount  int64  `gorm:"column:line_count;default:0" json:"line_count"` // 已处理的行数
 	CreateTime int64  `gorm:"column:create_time;not null" json:"create_time"`
-	IsDel      int8   `gorm:"column:is_del;not null;default:0" json:"is_del"` // 0-未删除，1-已删除
+	IsDel      int8   `gorm:"column:is_del;not null;default:0" json:"is_del"`       // 0-未删除，1-已删除
+	ExecTime   int    `gorm:"column:exec_time;not null;default:0" json:"exec_time"` // 执行时间
 }
 
 // TableName 指定表名
@@ -39,23 +40,30 @@ func (m *Distribution) List(query map[string]interface{}, page, pageSize int) ([
 	records := []Distribution{}
 
 	// 动态条件
-	queryDB := db.Model(&Distribution{})
-	if strategyID, ok := query["strategy_id"]; ok {
-		queryDB = queryDB.Where("strategy_id = ?", strategyID)
-	}
+	queryDB := db.Model(&Distribution{}).
+		Joins("LEFT JOIN crowd_rule ON crowd_rule.id = dmp_distribution.strategy_id").
+		Where("dmp_distribution.is_del = ?", 0) // 只查询未删除的记录
+
+	// 添加 exec_time 的比较条件
+	queryDB = queryDB.Where("dmp_distribution.exec_time < crowd_rule.exec_time OR dmp_distribution.exec_time = 0")
+
 	if status, ok := query["status"]; ok {
-		queryDB = queryDB.Where("status = ?", status)
+		queryDB = queryDB.Where("dmp_distribution.status = ?", status)
 	}
-	queryDB = queryDB.Where("is_del = ?", 0) // 只查询未删除的记录
 
 	// 分页
 	if page > 0 && pageSize > 0 {
 		queryDB = queryDB.Offset((page - 1) * pageSize).Limit(pageSize)
-
 	}
+
 	var total int64
-	queryDB.Count(&total)
-	err := queryDB.Find(&records).Error
+	// 使用原始SQL来计算总数，以确保正确统计关联后的记录数
+	err := queryDB.Count(&total).Error
+	if err != nil {
+		return nil, 0, err
+	}
+
+	err = queryDB.Find(&records).Error
 	if err != nil {
 		return nil, 0, err
 	}
@@ -77,4 +85,13 @@ func (d *Distribution) UpdateLineCount(id int, lineCount int64) error {
 		Update("line_count", lineCount)
 
 	return result.Error
+}
+
+// UpdateExecTime 更新任务的执行时间
+// execTime 为 Unix 时间戳
+func (d *Distribution) UpdateExecTime(id int, execTime int64) error {
+	db := mysqldb.GetConnected()
+	return db.Model(&Distribution{}).
+		Where("id = ?", id).
+		Update("exec_time", execTime).Error
 }
