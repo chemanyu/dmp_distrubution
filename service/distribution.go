@@ -25,10 +25,10 @@ const (
 	StreamBatchSize    = 1000
 	MaxParallelWorkers = 10
 	RedisBatchSize     = 500
-	TaskWaitStatus     = 0
-	TaskRunStatus      = 1
-	TaskDoneStatus     = 2
-	TaskFailStatus     = 3
+	TaskWaitStatus     = 1
+	TaskRunStatus      = 2
+	TaskDoneStatus     = 3
+	TaskFailStatus     = 4
 
 	// 进度更新相关常量
 	ProgressUpdateInterval = 60 * time.Second // 进度更新间隔
@@ -48,8 +48,8 @@ type DistributionService struct {
 	progressTicker *time.Ticker
 
 	// 进度追踪
-	progressMap    sync.Map          // 用于存储每个任务的进度
-	progressMutex  sync.RWMutex      // 用于保护进度更新
+	progressMap sync.Map // 用于存储每个任务的进度
+	//progressMutex  sync.RWMutex      // 用于保护进度更新
 	lastUpdateTime map[int]time.Time // 记录每个任务最后更新时间
 }
 
