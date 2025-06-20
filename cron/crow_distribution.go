@@ -20,6 +20,7 @@ var (
 
 // InitCronJobs 初始化并启动所有定时任务
 func InitCronJobs() {
+	log.Printf("[Cron] Initializing cron jobs...")
 	once.Do(func() {
 		cronInstance = cron.New(cron.WithSeconds())
 		setupDistributionJobs()
