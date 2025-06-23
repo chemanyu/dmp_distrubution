@@ -64,7 +64,7 @@ func (sp *serverPool) adjustPool() {
 		for i := 0; i < toRemove; i++ {
 			select {
 			case <-sp.pool:
-				log.Printf("adjustPool: Destroyed resource from '%s', new size: %d\n", sp.name, len(sp.pool))
+				log.Printf("adjustPool: Destroyed resource from '%s', new size: %d", sp.name, len(sp.pool))
 				// 监控销毁次数
 				ginprom.ServerPoolCounterVec.WithLabelValues("destroyed", "product", sp.name).Inc()
 			default:
