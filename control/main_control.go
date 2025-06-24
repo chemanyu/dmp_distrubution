@@ -54,9 +54,9 @@ func init() {
 	// 加载配置文件
 	config = core.LoadConfig(*cfg)
 	mysqldb.InitMysql()
-	redis.C32_Redis_Pools.Init_RedisPool(config.REDIS_POOL_DB)
+	redis.C32_Redis_Pools.Init_RedisPool(config.REDIS_POOL_DB_CRC)
 	// 初始化 Redis
-	redis.InitRedis(config.REDIS_POOL_DB)
+	redis.Mates.InitRedis(config.REDIS_POOL_DB)
 	cron.InitCronJobs()
 }
 
@@ -70,7 +70,9 @@ func MainControl() {
 	router.Use(gin.Recovery()) // Gin 的错误恢复中间件
 	router.Use(gin.Logger())   // Gin 的日志中间件
 
-	regHandlers := []handlers.Handler{}
+	regHandlers := []handlers.Handler{
+		handlers.GetReportApiHandler,
+	}
 
 	// 注册路由
 	for _, handler := range regHandlers {

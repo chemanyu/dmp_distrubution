@@ -13,8 +13,6 @@ import (
 
 	"dmp_distribution/module"
 	"dmp_distribution/platform"
-
-	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -25,6 +23,7 @@ const (
 	StreamBatchSize    = 1000
 	MaxParallelWorkers = 10
 	RedisBatchSize     = 500
+	TaskNoStartStatus  = 0 // 任务未开始状态
 	TaskWaitStatus     = 1
 	TaskRunStatus      = 2
 	TaskDoneStatus     = 3
@@ -39,7 +38,6 @@ const (
 type DistributionService struct {
 	distModel      *module.Distribution
 	crowdRule      *module.CrowdRule
-	rdb            *redis.ClusterClient
 	ctx            context.Context
 	cancel         context.CancelFunc
 	taskChan       chan *module.Distribution
@@ -62,12 +60,11 @@ type taskProgress struct {
 }
 
 // NewDistributionService 创建新的分发服务
-func NewDistributionService(model *module.Distribution, rdb *redis.ClusterClient) *DistributionService {
+func NewDistributionService(model *module.Distribution) *DistributionService {
 	ctx, cancel := context.WithCancel(context.Background())
 	srv := &DistributionService{
 		distModel:      model,
 		crowdRule:      &module.CrowdRule{},
-		rdb:            rdb,
 		ctx:            ctx,
 		cancel:         cancel,
 		taskChan:       make(chan *module.Distribution, 100),
@@ -115,6 +112,7 @@ func (s *DistributionService) taskProcessor() {
 				} else {
 					log.Printf("Task %d completed successfully after %v", t.ID, time.Since(startTime))
 					s.distModel.UpdateExecTime(t.ID, time.Now().Unix())
+					s.Stop()
 				}
 			}(task)
 		}
@@ -150,39 +148,34 @@ func (s *DistributionService) Stop() {
 // StartTaskScheduler 启动任务调度器
 func (s *DistributionService) StartTaskScheduler() {
 	log.Printf("Starting task scheduler")
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
+	// 如果需要手动判断服务是否在运行
+	if !s.isRunning {
+		log.Printf("Task scheduler stopped: service not running")
+		return
+	}
 
-	for {
+	// 每次查询最多100个待处理任务
+	tasks, _, err := s.distModel.List(map[string]interface{}{
+		"status": TaskNoStartStatus,
+	}, 0, 0)
+
+	log.Print("Checking for new tasks to process...", tasks)
+
+	if err != nil {
+		log.Printf("List tasks error: %v", err)
+		return
+	}
+
+	for _, task := range tasks {
 		select {
 		case <-s.ctx.Done():
 			log.Printf("Task scheduler stopped: context cancelled")
 			return
-		case <-ticker.C:
-			if !s.isRunning {
-				log.Printf("Task scheduler stopped: service not running")
-				return
-			}
-
-			// 每次查询最多100个待处理任务
-			tasks, _, err := s.distModel.List(map[string]interface{}{
-				"status": TaskWaitStatus,
-			}, 0, 0)
-			if err != nil {
-				log.Printf("List tasks error: %v", err)
-				continue
-			}
-
-			for _, task := range tasks {
-				select {
-				case <-s.ctx.Done():
-					return
-				case s.taskChan <- &task:
-					log.Printf("Scheduled task %d for processing", task.ID)
-				default:
-					log.Printf("Task channel full, skipping task %d", task.ID)
-				}
-			}
+		case s.taskChan <- &task:
+			log.Printf("Scheduled task %d for processing", task.ID)
+			s.distModel.UpdateStatus(task.ID, TaskWaitStatus)
+		default:
+			log.Printf("Task channel full, skipping task %d", task.ID)
 		}
 	}
 }
@@ -228,7 +221,8 @@ func (s *DistributionService) processTask(task *module.Distribution) error {
 func (s *DistributionService) streamProcessFile(task *module.Distribution, processor func([]map[string]string) error) error {
 	file, err := os.Open(task.Path)
 	if err != nil {
-		return fmt.Errorf("open file error: %w", err)
+		log.Printf("Failed to open file %s: %v", task.Path, err)
+		return fmt.Errorf("open file error:%s, %w", task.Path, err)
 	}
 	defer file.Close()
 
@@ -298,7 +292,7 @@ func (s *DistributionService) processBatch(task *module.Distribution, batch []ma
 
 		retry := 0
 		for retry <= RetryMaxTimes {
-			if err := platformServers.Distribution(s.rdb, task, batch[i:end]); err == nil {
+			if err := platformServers.Distribution(task, batch[i:end]); err == nil {
 				break
 			}
 			retry++

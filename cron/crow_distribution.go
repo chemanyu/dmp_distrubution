@@ -5,7 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"dmp_distribution/common/redis"
 	"dmp_distribution/module"
 	"dmp_distribution/service"
 
@@ -32,28 +31,13 @@ func InitCronJobs() {
 // setupDistributionJobs 配置所有与分发相关的定时任务
 func setupDistributionJobs() {
 	// 添加分发任务，每5分钟执行一次
-	_, err := cronInstance.AddFunc("0 */5 * * * *", func() {
+	_, err := cronInstance.AddFunc("0 0 13 * * *", func() {
 		log.Printf("[Cron] Starting distribution job at %v", time.Now().Format("2006-01-02 15:04:05"))
 
-		// 如果服务已经在运行，不需要重新创建
-		if distributionSvc != nil && distributionSvc.IsRunning() {
-			log.Printf("[Cron] Distribution service is already running")
-			return
-		}
-
-		// 停止现有服务（如果有）
-		if distributionSvc != nil {
-			distributionSvc.Stop()
-		}
-
-		// 初始化 Redis 客户端
-		rdb := redis.NewData(nil)
-
 		// 创建分发服务实例
-		distributionSvc = service.NewDistributionService(&module.Distribution{}, rdb.RedisPool)
-
+		distributionSvc = service.NewDistributionService(&module.Distribution{})
 		// 启动任务调度器（会在后台持续运行）
-		go distributionSvc.StartTaskScheduler()
+		distributionSvc.StartTaskScheduler()
 
 		log.Printf("[Cron] Distribution service started successfully")
 	})

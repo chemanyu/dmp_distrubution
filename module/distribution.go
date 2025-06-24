@@ -40,6 +40,7 @@ func (m *Distribution) List(query map[string]interface{}, page, pageSize int) ([
 	records := []Distribution{}
 
 	// 动态条件
+	//queryDB := db.Model(&Distribution{}).
 	queryDB := db.Model(&Distribution{}).
 		Joins("LEFT JOIN crowd_rule ON crowd_rule.id = dmp_distribution.strategy_id").
 		Where("dmp_distribution.is_del = ?", 0) // 只查询未删除的记录

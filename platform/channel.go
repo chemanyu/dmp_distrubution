@@ -8,12 +8,10 @@ import (
 	"time"
 
 	ginprom "dmp_distribution/common/ginporm"
-
-	"github.com/redis/go-redis/v9"
 )
 
 type Platform interface {
-	Distribution(rdb *redis.ClusterClient, task *module.Distribution, batches []map[string]string) error //接受回调事件AcceptTrack ocpx
+	Distribution(task *module.Distribution, batches []map[string]string) error //接受回调事件AcceptTrack ocpx
 }
 
 type TaskServerRegistry struct {

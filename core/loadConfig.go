@@ -14,6 +14,7 @@ type Config struct {
 	DORIS_DB          string
 	REDIS_DB          string
 	REDIS_POOL_DB     string
+	REDIS_POOL_DB_CRC string
 	SERVER_PORT       string
 	SERVER_ADDRESS    string
 	LOG_PATH          string
@@ -34,11 +35,12 @@ func LoadConfig(cfg string) *Config {
 	viper.ReadInConfig()
 
 	config = &Config{
-		MYSQL_DB:      getViperStringValue("MYSQL_DB"),
-		DORIS_DB:      getViperStringValue("DORIS_DB"),
-		REDIS_DB:      getViperStringValue("REDIS_DB"),
-		REDIS_POOL_DB: getViperStringValue("REDIS_POOL_DB"),
-		// SERVER_PORT:       getViperStringValue("SERVER_PORT"),
+		MYSQL_DB:          getViperStringValue("MYSQL_DB"),
+		DORIS_DB:          getViperStringValue("DORIS_DB"),
+		REDIS_DB:          getViperStringValue("REDIS_DB"),
+		REDIS_POOL_DB:     getViperStringValue("REDIS_POOL_DB"),
+		REDIS_POOL_DB_CRC: getViperStringValue("REDIS_POOL_DB_CRC"),
+		SERVER_PORT:       getViperStringValue("SERVER_PORT"),
 		// SERVER_ADDRESS:    getViperStringValue("SERVER_ADDRESS"),
 		// LOG_PATH:          getViperStringValue("LOG_PATH"),
 		// SYSTEM_MODE:       getViperStringValue("SYSTEM_MODE"),       //release debug

@@ -6,9 +6,8 @@ import (
 	"log"
 	"time"
 
+	"dmp_distribution/common/redis"
 	"dmp_distribution/module"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // Ssp SSP平台实现
@@ -16,9 +15,9 @@ type Ssp struct{}
 
 // Distribution 实现批量数据分发到SSP平台
 // 数据格式：hset h:user:{USER_ID} TG:{crowd_id} timestamp
-func (s *Ssp) Distribution(rdb *redis.ClusterClient, task *module.Distribution, batches []map[string]string) error {
+func (s *Ssp) Distribution(task *module.Distribution, batches []map[string]string) error {
 	ctx := context.Background()
-	pipe := rdb.Pipeline()
+	pipe := redis.Mates.RedisPool.Pipeline()
 	now := time.Now().UnixMilli() // 获取13位毫秒级时间戳
 	processedCount := 0
 
@@ -35,7 +34,13 @@ func (s *Ssp) Distribution(rdb *redis.ClusterClient, task *module.Distribution, 
 			key := fmt.Sprintf("h:user:%s", userID)
 			field := fmt.Sprintf("TG:%s", task.Crowd) // task.Crowd 是字符串类型
 
-			// 使用pipeline添加命令
+			log.Printf("Setting data - key: %s, field: %s, value: %d", key, field, now)
+			// err := redis.Mates.RedisHSet(key, field, now)
+			// if err == nil {
+			// 	log.Printf("Failed to err %v", err)
+			// 	break
+			// }
+			//使用pipeline添加命令
 			pipe.HSet(ctx, key, field, now)
 			processedCount++
 
@@ -45,7 +50,7 @@ func (s *Ssp) Distribution(rdb *redis.ClusterClient, task *module.Distribution, 
 					log.Printf("Failed to execute pipeline at count %d: %v", processedCount, err)
 					return fmt.Errorf("failed to push data to redis at count %d: %v", processedCount, err)
 				}
-				pipe = rdb.Pipeline() // 创建新的pipeline
+				pipe = redis.Mates.RedisPool.Pipeline() // 创建新的pipeline
 			}
 		}
 	}

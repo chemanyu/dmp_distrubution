@@ -2,28 +2,17 @@ package redis
 
 import (
 	"context"
-	"database/sql"
 	"log"
 	"strings"
 	"sync"
 	"time"
-
-	"dmp_distribution/core"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang/groupcache/lru"
 	"github.com/redis/go-redis/v9" // Redis 集群库
 )
 
-var redisAddrs string
-
-func InitRedis(redisAddrs string) {
-	// 初始化 Redis 地址
-	redisAddrs = core.GetConfig().REDIS_POOL_DB
-	if redisAddrs == "" {
-		log.Fatal("REDIS_POOL_DB must be set in the configuration")
-	}
-}
+var Mates *Mate
 
 type Mate struct {
 	lruData   *lru.Cache
@@ -31,7 +20,16 @@ type Mate struct {
 	pushLock  *sync.RWMutex
 }
 
-func NewData(msPool *sql.DB) *Mate {
+func init() {
+	Mates = &Mate{}
+}
+
+func (r *Mate) InitRedis(redisAddrs string) {
+	// 初始化 Redis 地址
+	if redisAddrs == "" {
+		log.Fatal("REDIS_POOL_DB must be set in the configuration")
+	}
+
 	Ip_ports := strings.Split(redisAddrs, ",")
 	clusterOptions := &redis.ClusterOptions{
 		Addrs:           Ip_ports,
@@ -42,15 +40,12 @@ func NewData(msPool *sql.DB) *Mate {
 		PoolTimeout:     1 * time.Minute,        // 当所有连接都忙时的等待超时时间
 		ConnMaxLifetime: 30 * time.Minute,       // 连接生存时间
 		PoolFIFO:        true,
-		//IdleTimeout:    5 * time.Minute, // 空闲连接在被关闭之前的保持时间
+		//IdleTimeout:     5 * time.Minute, // 空闲连接在被关闭之前的保持时间
 	}
 
 	rdb := redis.NewClusterClient(clusterOptions)
 
-	return &Mate{
-		lruData:   lru.New(100000), // 使用 LRU 缓存
-		RedisPool: rdb,             // 替换为 Redis 集群客户端
-	}
+	r.RedisPool = rdb
 }
 
 func (c *Mate) lruGet(key string) (ret []byte) {
@@ -62,6 +57,17 @@ func (c *Mate) lruGet(key string) (ret []byte) {
 	} else {
 		return nil
 	}
+}
+
+// hSet 缓存数据到 Redis
+func (c *Mate) RedisHSet(key string, field string, value int64) error {
+	ctx := context.Background() // 创建上下文
+	err := c.RedisPool.HSet(ctx, key, field, value).Err()
+	if err != nil && gin.DebugMode == "debug" {
+		log.Println("RedisHSet:", err.Error())
+		return err
+	}
+	return redis.Nil
 }
 
 func (c *Mate) RedisGet(key string) []byte {
