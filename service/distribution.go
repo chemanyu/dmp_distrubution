@@ -314,32 +314,27 @@ func (s *DistributionService) parseLine(line string, task *module.Distribution) 
 	}
 
 	deviceInfo := make(map[string]string)
-	if task.Imei == 1 && len(fields) > 0 {
-		if imei := s.cleanIMEI(fields[0]); imei != "" {
-			deviceInfo["imei"] = imei
-		}
+	if task.UserID == 1 {
+		deviceInfo["user_id"] = fields[1]
 	}
-	// 其他字段处理...
-	if task.Oaid == 1 && len(fields) > 1 {
-		if oaid := s.cleanOAID(fields[1]); oaid != "" {
+	if task.Oaid == 1 {
+		if oaid := s.cleanOAID(fields[2]); oaid != "" {
 			deviceInfo["oaid"] = oaid
 		}
 	}
-	if task.Idfa == 1 && len(fields) > 2 {
-		if idfa := s.cleanIDFA(fields[2]); idfa != "" {
+	if task.Caid == 1 {
+		deviceInfo["caid"] = fields[3]
+	}
+	if task.Idfa == 1 {
+		if idfa := s.cleanIDFA(fields[4]); idfa != "" {
 			deviceInfo["idfa"] = idfa
 		}
 	}
-	if task.Caid == 1 && len(fields) > 3 {
-		deviceInfo["caid"] = fields[3]
+	if task.Imei == 1 {
+		if imei := s.cleanIMEI(fields[5]); imei != "" {
+			deviceInfo["imei"] = imei
+		}
 	}
-	if task.Caid2 == 1 && len(fields) > 4 {
-		deviceInfo["caid2"] = fields[4]
-	}
-	if task.UserID == 1 && len(fields) > 5 {
-		deviceInfo["user_id"] = fields[5]
-	}
-
 	return deviceInfo, len(deviceInfo) > 0
 }
 
@@ -389,9 +384,6 @@ func (s *DistributionService) cleanOAID(oaid string) string {
 // cleanIDFA 清洗IDFA数据
 func (s *DistributionService) cleanIDFA(idfa string) string {
 	idfa = strings.TrimSpace(strings.ToUpper(idfa))
-	if len(idfa) != 36 { // UUID格式
-		return ""
-	}
 	return idfa
 }
 
