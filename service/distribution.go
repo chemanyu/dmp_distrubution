@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -217,62 +219,188 @@ func (s *DistributionService) processTask(task *module.Distribution) error {
 	return s.finalizeTask(task, TaskDoneStatus, nil)
 }
 
+// findRemoteFiles 在远程服务器上查找匹配的文件
+func (s *DistributionService) findRemoteFiles(serverIP, remotePattern string) ([]string, error) {
+	// 使用ssh执行ls命令来获取匹配的文件列表
+	cmd := exec.Command("ssh", fmt.Sprintf("root@%s", serverIP), "ls -1", remotePattern)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list remote files: %w", err)
+	}
+
+	// 解析输出得到文件列表
+	files := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(files) == 0 || (len(files) == 1 && files[0] == "") {
+		return nil, fmt.Errorf("no files found matching pattern: %s", remotePattern)
+	}
+
+	return files, nil
+}
+
+// downloadRemoteFile 下载远程文件到本地临时目录
+func (s *DistributionService) downloadRemoteFile(remotePath string) ([]string, error) {
+	// 解析远程文件路径
+	remotePath = strings.TrimPrefix(remotePath, "file://")
+	parts := strings.SplitN(remotePath, "/", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid remote file path: %s", remotePath)
+	}
+
+	serverIP := parts[0]
+	remoteFilePath := "/" + parts[1]
+
+	// 创建本地临时目录
+	tempDir := "./"
+	downloadDir := filepath.Join(tempDir, "dmp_downloads")
+	if err := os.MkdirAll(downloadDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create download directory: %w", err)
+	}
+
+	// 获取匹配的远程文件列表
+	matchedFiles, err := s.findRemoteFiles(serverIP, remoteFilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("Found %d matching files on remote server", len(matchedFiles))
+
+	// 下载所有匹配的文件
+	var localPaths []string
+	timestamp := time.Now().Format("20060102150405")
+
+	for idx, remoteFile := range matchedFiles {
+		// 生成本地文件路径
+		fileName := filepath.Base(remoteFile)
+		localPath := filepath.Join(downloadDir, fmt.Sprintf("%s_%d_%s", timestamp, idx, fileName))
+
+		// 使用scp下载文件
+		cmd := exec.Command("scp", fmt.Sprintf("root@%s:%s", serverIP, remoteFile), localPath)
+		cmd.Stderr = os.Stderr
+
+		log.Printf("Downloading file %d/%d: %s -> %s", idx+1, len(matchedFiles), remoteFile, localPath)
+
+		if err := cmd.Run(); err != nil {
+			// 如果下载失败，清理已下载的文件
+			for _, path := range localPaths {
+				s.cleanupTempFile(path)
+			}
+			return nil, fmt.Errorf("failed to download file %s: %w", remoteFile, err)
+		}
+
+		localPaths = append(localPaths, localPath)
+	}
+
+	return localPaths, nil
+}
+
+// cleanupTempFile 清理临时文件
+func (s *DistributionService) cleanupTempFile(path string) {
+	if strings.Contains(path, "dmp_downloads") {
+		if err := os.Remove(path); err != nil {
+			log.Printf("Failed to cleanup temp file %s: %v", path, err)
+		} else {
+			log.Printf("Successfully cleaned up temp file: %s", path)
+		}
+	}
+}
+
 // streamProcessFile 流式处理大文件
 func (s *DistributionService) streamProcessFile(task *module.Distribution, processor func([]map[string]string) error) error {
-	file, err := os.Open(task.Path)
-	if err != nil {
-		log.Printf("Failed to open file %s: %v", task.Path, err)
-		return fmt.Errorf("open file error:%s, %w", task.Path, err)
-	}
-	defer file.Close()
+	var localPaths []string
+	var err error
 
-	var (
-		scanner   = bufio.NewScanner(file)
-		batch     = make([]map[string]string, 0, StreamBatchSize)
-		batchSize int64
-	)
-
-	// 初始化进度记录
-	s.progressMap.Store(task.ID, &taskProgress{
-		lastUpdate: time.Now(),
-	})
-
-	for scanner.Scan() {
-		if !s.isRunning {
-			return fmt.Errorf("service stopped")
+	// 检查是否是远程文件
+	if strings.HasPrefix(task.Path, "file://") {
+		// 下载远程文件
+		localPaths, err = s.downloadRemoteFile(task.Path)
+		if err != nil {
+			log.Printf("Failed to download remote files %s: %v", task.Path, err)
+			return fmt.Errorf("download files error: %w", err)
 		}
-
-		deviceInfo, valid := s.parseLine(scanner.Text(), task)
-		if !valid {
-			continue
-		}
-
-		batch = append(batch, deviceInfo)
-		batchSize++
-
-		// 批次处理
-		if len(batch) >= StreamBatchSize {
-			if err := processor(batch); err != nil {
-				return err
+		// 确保在处理完成后清理所有临时文件
+		defer func() {
+			for _, path := range localPaths {
+				s.cleanupTempFile(path)
 			}
-			s.updateProgress(task.ID, batchSize)
-			batch = batch[:0] // 清空批次
-			batchSize = 0
+		}()
+		log.Printf("Successfully downloaded %d remote files", len(localPaths))
+	} else {
+		localPaths = []string{task.Path}
+	}
+
+	var totalProcessed int64
+	// 处理所有文件
+	for fileIdx, filePath := range localPaths {
+		log.Printf("Processing file %d/%d: %s", fileIdx+1, len(localPaths), filePath)
+
+		// 打开文件进行处理
+		file, err := os.Open(filePath)
+		if err != nil {
+			log.Printf("Failed to open file %s: %v", filePath, err)
+			return fmt.Errorf("open file error: %w", err)
+		}
+
+		var (
+			scanner   = bufio.NewScanner(file)
+			batch     = make([]map[string]string, 0, StreamBatchSize)
+			batchSize int64
+		)
+
+		// 增加扫描器的缓冲区大小
+		buffer := make([]byte, 0, 1024*1024)
+		scanner.Buffer(buffer, 1024*1024)
+
+		// 使用匿名函数确保文件正确关闭
+		processErr := func() error {
+			defer file.Close()
+
+			for scanner.Scan() {
+				if !s.isRunning {
+					return fmt.Errorf("service stopped")
+				}
+
+				deviceInfo, valid := s.parseLine(scanner.Text(), task)
+				if !valid {
+					continue
+				}
+
+				batch = append(batch, deviceInfo)
+				batchSize++
+
+				// 批次处理
+				if len(batch) >= StreamBatchSize {
+					if err := processor(batch); err != nil {
+						return fmt.Errorf("process batch error: %w", err)
+					}
+					s.updateProgress(task.ID, batchSize)
+					totalProcessed += batchSize
+					batch = batch[:0]
+					batchSize = 0
+				}
+			}
+
+			// 处理剩余数据
+			if len(batch) > 0 {
+				if err := processor(batch); err != nil {
+					return fmt.Errorf("process final batch error: %w", err)
+				}
+				s.updateProgress(task.ID, batchSize)
+				totalProcessed += batchSize
+			}
+
+			return scanner.Err()
+		}()
+
+		if processErr != nil {
+			return fmt.Errorf("error processing file %s: %w", filePath, processErr)
 		}
 	}
 
-	// 处理剩余数据
-	if len(batch) > 0 {
-		if err := processor(batch); err != nil {
-			return err
-		}
-		s.updateProgress(task.ID, batchSize)
-	}
-
+	log.Printf("Total processed lines across all files: %d", totalProcessed)
 	// 确保最终进度被写入数据库
 	s.flushProgress()
 
-	return scanner.Err()
+	return nil
 }
 
 // processBatch 处理单个批次
