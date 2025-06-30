@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"dmp_distribution/common/redis"
@@ -19,6 +20,20 @@ func StrMd5(str string) string {
 	hash := md5.New()
 	hash.Write([]byte(str))
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// IsMD5 判断字符串是否是MD5值
+func IsMD5(str string) bool {
+	if len(str) != 32 {
+		return false
+	}
+	// MD5值只包含16进制字符 (0-9, a-f)
+	for _, c := range str {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // Distribution 实现批量数据分发到ADN平台
@@ -48,7 +63,13 @@ func (a *Adn) Distribution(task *module.Distribution, batches []map[string]strin
 			}
 
 			// 计算设备ID的MD5作为key
-			deviceMD5 := StrMd5(deviceID)
+			// 判断是否已经是MD5值
+			var deviceMD5 string
+			if IsMD5(deviceID) {
+				deviceMD5 = strings.ToLower(deviceID) // 确保MD5值为小写
+			} else {
+				deviceMD5 = StrMd5(deviceID)
+			}
 			keyName := fmt.Sprintf("crowd_%s", deviceMD5)
 
 			// 设置字段值（crowd_id -> expiration_timestamp）

@@ -240,7 +240,7 @@ func (s *DistributionService) findRemoteFiles(serverIP, remotePattern string) ([
 // downloadRemoteFile 下载远程文件到本地临时目录
 func (s *DistributionService) downloadRemoteFile(remotePath string) ([]string, error) {
 	// 解析远程文件路径
-	remotePath = strings.TrimPrefix(remotePath, "file://")
+	remotePath = strings.TrimPrefix(remotePath, "file:///")
 	parts := strings.SplitN(remotePath, "/", 2)
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("invalid remote file path: %s", remotePath)
@@ -446,20 +446,27 @@ func (s *DistributionService) parseLine(line string, task *module.Distribution) 
 		deviceInfo["user_id"] = fields[1]
 	}
 	if task.Oaid == 1 {
-		if oaid := s.cleanOAID(fields[2]); oaid != "" {
+		if oaid := strings.TrimSpace(fields[2]); oaid != "" {
 			deviceInfo["oaid"] = oaid
 		}
 	}
 	if task.Caid == 1 {
-		deviceInfo["caid"] = fields[3]
+		// 处理可能包含多个CAID的情况
+		if caids := strings.Split(fields[3], ","); len(caids) > 0 {
+			for i, caid := range caids {
+				if caid = strings.TrimSpace(caid); caid != "" {
+					deviceInfo[fmt.Sprintf("caid_%d", i+1)] = caid
+				}
+			}
+		}
 	}
 	if task.Idfa == 1 {
-		if idfa := s.cleanIDFA(fields[4]); idfa != "" {
+		if idfa := strings.TrimSpace(fields[4]); idfa != "" {
 			deviceInfo["idfa"] = idfa
 		}
 	}
 	if task.Imei == 1 {
-		if imei := s.cleanIMEI(fields[5]); imei != "" {
+		if imei := strings.TrimSpace(fields[5]); imei != "" {
 			deviceInfo["imei"] = imei
 		}
 	}
@@ -484,35 +491,6 @@ func (s *DistributionService) finalizeTask(task *module.Distribution, status int
 		log.Printf("Task %d failed: %v", task.ID, err)
 	}
 	return s.distModel.UpdateStatus(task.ID, status)
-}
-
-func (s *DistributionService) cleanIMEI(imei string) string {
-	// 去除空格和特殊字符
-	imei = strings.TrimSpace(imei)
-	imei = strings.Map(func(r rune) rune {
-		if r >= '0' && r <= '9' {
-			return r
-		}
-		return -1
-	}, imei)
-
-	// 验证IMEI长度
-	if len(imei) != 15 {
-		return ""
-	}
-
-	return imei
-}
-
-// cleanOAID 清洗OAID数据
-func (s *DistributionService) cleanOAID(oaid string) string {
-	return strings.TrimSpace(oaid)
-}
-
-// cleanIDFA 清洗IDFA数据
-func (s *DistributionService) cleanIDFA(idfa string) string {
-	idfa = strings.TrimSpace(strings.ToUpper(idfa))
-	return idfa
 }
 
 // flushProgress 将内存中的进度刷新到数据库
