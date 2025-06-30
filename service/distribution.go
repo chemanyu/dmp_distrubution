@@ -240,7 +240,7 @@ func (s *DistributionService) findRemoteFiles(serverIP, remotePattern string) ([
 // downloadRemoteFile 下载远程文件到本地临时目录
 func (s *DistributionService) downloadRemoteFile(remotePath string) ([]string, error) {
 	// 解析远程文件路径
-	remotePath = strings.TrimPrefix(remotePath, "file://")
+	remotePath = strings.TrimPrefix(remotePath, "file:///")
 	log.Printf("Downloading remote file from path: %s", remotePath)
 	parts := strings.SplitN(remotePath, "/", 2)
 	if len(parts) != 2 {
