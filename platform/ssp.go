@@ -34,7 +34,7 @@ func (s *Ssp) Distribution(task *module.Distribution, batches []map[string]strin
 			key := fmt.Sprintf("h:user:%s", userID)
 			field := fmt.Sprintf("TG:%s", task.Crowd) // task.Crowd 是字符串类型
 
-			log.Printf("Setting data - key: %s, field: %s, value: %d", key, field, now)
+			//log.Printf("Setting data - key: %s, field: %s, value: %d", key, field, now)
 			// err := redis.Mates.RedisHSet(key, field, now)
 			// if err == nil {
 			// 	log.Printf("Failed to err %v", err)

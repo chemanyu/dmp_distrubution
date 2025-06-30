@@ -225,7 +225,7 @@ func (s *DistributionService) findRemoteFiles(serverIP, remotePattern string) ([
 	cmd := exec.Command("ssh", fmt.Sprintf("root@%s", serverIP), "ls -1", remotePattern)
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list remote files: %w", err)
+		return nil, fmt.Errorf("failed to list remote files: %w, cmd: %s", err, cmd.String())
 	}
 
 	// 解析输出得到文件列表
@@ -240,7 +240,8 @@ func (s *DistributionService) findRemoteFiles(serverIP, remotePattern string) ([
 // downloadRemoteFile 下载远程文件到本地临时目录
 func (s *DistributionService) downloadRemoteFile(remotePath string) ([]string, error) {
 	// 解析远程文件路径
-	remotePath = strings.TrimPrefix(remotePath, "file:///")
+	remotePath = strings.TrimPrefix(remotePath, "file://")
+	log.Printf("Downloading remote file from path: %s", remotePath)
 	parts := strings.SplitN(remotePath, "/", 2)
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("invalid remote file path: %s", remotePath)
@@ -436,7 +437,7 @@ func (s *DistributionService) processBatch(task *module.Distribution, batch []ma
 
 // parseLine 优化后的行解析
 func (s *DistributionService) parseLine(line string, task *module.Distribution) (map[string]string, bool) {
-	fields := strings.Split(line, ",")
+	fields := strings.Fields(line)
 	if len(fields) == 0 {
 		return nil, false
 	}
