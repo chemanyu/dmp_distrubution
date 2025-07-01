@@ -78,8 +78,8 @@ func (a *Adn) Distribution(task *module.Distribution, batches []map[string]strin
 			}
 
 			// 使用CRC32_RedisPool推送数据
-			log.Print("keyName", keyName)
-			log.Print("Setting hash data", fieldsAndValues)
+			// log.Print("keyName", keyName)
+			// log.Print("Setting hash data", fieldsAndValues)
 			err := redis.C32_Redis_Pools.MSetHash_KeyData_Redis(keyName, fieldsAndValues)
 			if err != nil {
 				log.Printf("Failed to set hash data in Redis for device %s: %v", deviceID, err)
@@ -87,8 +87,8 @@ func (a *Adn) Distribution(task *module.Distribution, batches []map[string]strin
 			}
 
 			// 设置过期时间
-			log.Print("keyName", keyName)
-			log.Print("expires in seconds", expirationSeconds)
+			// log.Print("keyName", keyName)
+			// log.Print("expires in seconds", expirationSeconds)
 			err = redis.C32_Redis_Pools.Expire(keyName, expirationSeconds)
 			if err != nil {
 				log.Printf("Failed to set expiration for device %s: %v", deviceID, err)

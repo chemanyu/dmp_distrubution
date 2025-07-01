@@ -93,7 +93,9 @@ func (s *DistributionService) taskProcessor() {
 			return
 		case task, ok := <-s.taskChan:
 			if !ok {
-				log.Printf("Task processor stopped: channel closed")
+				s.wg.Wait() // 等待所有正在执行的任务完成
+				log.Printf("All tasks completed, stopping service")
+				s.Stop()
 				return
 			}
 
@@ -114,16 +116,10 @@ func (s *DistributionService) taskProcessor() {
 				} else {
 					log.Printf("Task %d completed successfully after %v", t.ID, time.Since(startTime))
 					s.distModel.UpdateExecTime(t.ID, time.Now().Unix())
-					s.Stop()
 				}
 			}(task)
 		}
 	}
-}
-
-// IsRunning 返回服务是否正在运行
-func (s *DistributionService) IsRunning() bool {
-	return s.isRunning
 }
 
 // Stop 停止服务
@@ -136,9 +132,6 @@ func (s *DistributionService) Stop() {
 	if s.cancel != nil {
 		s.cancel()
 	}
-
-	close(s.taskChan)
-	s.wg.Wait()
 
 	if s.progressTicker != nil {
 		s.progressTicker.Stop()
@@ -166,6 +159,7 @@ func (s *DistributionService) StartTaskScheduler() {
 		return
 	}
 
+	// 提交所有任务到任务通道
 	for _, task := range tasks {
 		select {
 		case <-s.ctx.Done():
@@ -178,6 +172,11 @@ func (s *DistributionService) StartTaskScheduler() {
 			log.Printf("Task channel full, skipping task %d", task.ID)
 		}
 	}
+
+	// 所有任务提交完成后关闭任务通道
+	// 这会触发 taskProcessor 中的逻辑来等待所有任务完成后停止服务
+	close(s.taskChan)
+	log.Printf("All tasks submitted, task channel closed")
 }
 
 // progressPersister 定期将内存中的进度持久化到数据库
@@ -507,7 +506,6 @@ func (s *DistributionService) flushProgress() {
 		// 只有当处理行数显著增加或距离上次更新时间较长时才更新
 		if currentCount-lastDBCount >= MinProgressDiff ||
 			now.Sub(progress.lastUpdate) >= ProgressUpdateInterval {
-
 			if err := s.distModel.UpdateLineCount(taskID, currentCount); err != nil {
 				log.Printf("Failed to update line count for task %d: %v", taskID, err)
 			} else {
