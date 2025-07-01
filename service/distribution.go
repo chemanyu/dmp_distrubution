@@ -157,9 +157,7 @@ func (s *DistributionService) StartTaskScheduler() {
 	}
 
 	// 每次查询最多100个待处理任务
-	tasks, _, err := s.distModel.List(map[string]interface{}{
-		"status": TaskNoStartStatus,
-	}, 0, 0)
+	tasks, _, err := s.distModel.List(map[string]interface{}{}, 0, 0)
 
 	log.Print("Checking for new tasks to process...", tasks)
 
