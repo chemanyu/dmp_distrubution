@@ -21,6 +21,15 @@ func (s *Ssp) Distribution(task *module.Distribution, batches []map[string]strin
 	now := time.Now().UnixMilli() // 获取13位毫秒级时间戳
 	processedCount := 0
 
+	// tomorrow := time.Now().AddDate(0, 0, 1).Format("2006-01-02")
+	// expirationDate, err := time.Parse("2006-01-02", tomorrow)
+	// if err != nil {
+	// 	log.Printf("Failed to parse expiration date: %v", err)
+	// 	return fmt.Errorf("failed to parse expiration date: %v", err)
+	// }
+	// expirationTime := expirationDate.AddDate(0, 0, 1)
+	// expirationSeconds := int(expirationTime.Sub(expirationDate).Seconds())
+
 	// 批量处理所有设备
 	for _, device := range batches {
 		for fieldName, userID := range device {
@@ -34,14 +43,9 @@ func (s *Ssp) Distribution(task *module.Distribution, batches []map[string]strin
 			key := fmt.Sprintf("h:user:%s", userID)
 			field := fmt.Sprintf("TG:%s", task.Crowd) // task.Crowd 是字符串类型
 
-			//log.Printf("Setting data - key: %s, field: %s, value: %d", key, field, now)
-			// err := redis.Mates.RedisHSet(key, field, now)
-			// if err == nil {
-			// 	log.Printf("Failed to err %v", err)
-			// 	break
-			// }
 			//使用pipeline添加命令
 			pipe.HSet(ctx, key, field, now)
+			//pipe.Expire(ctx, key, time.Duration(expirationSeconds)*time.Second) // 设置过期时间
 			processedCount++
 
 			// 每1000条数据执行一次pipeline，避免单个pipeline太大

@@ -3,8 +3,11 @@ package service
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -216,92 +219,6 @@ func (s *DistributionService) processTask(task *module.Distribution) error {
 	return s.finalizeTask(task, TaskDoneStatus, nil)
 }
 
-// findRemoteFiles 在远程服务器上查找匹配的文件
-func (s *DistributionService) findRemoteFiles(serverIP, remotePattern string) ([]string, error) {
-	// 使用ssh执行ls命令来获取匹配的文件列表
-	cmd := exec.Command("ssh", fmt.Sprintf("root@%s", serverIP), "ls -1", remotePattern)
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list remote files: %w, cmd: %s", err, cmd.String())
-	}
-
-	// 解析输出得到文件列表
-	files := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(files) == 0 || (len(files) == 1 && files[0] == "") {
-		return nil, fmt.Errorf("no files found matching pattern: %s", remotePattern)
-	}
-
-	return files, nil
-}
-
-// downloadRemoteFile 下载远程文件到本地临时目录
-func (s *DistributionService) downloadRemoteFile(remotePath string) ([]string, error) {
-	// 解析远程文件路径
-	remotePath = strings.TrimPrefix(remotePath, "file:///")
-	log.Printf("Downloading remote file from path: %s", remotePath)
-	parts := strings.SplitN(remotePath, "/", 2)
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid remote file path: %s", remotePath)
-	}
-
-	serverIP := parts[0]
-	remoteFilePath := "/" + parts[1]
-
-	// 创建本地临时目录
-	tempDir := "./"
-	downloadDir := filepath.Join(tempDir, "dmp_downloads")
-	if err := os.MkdirAll(downloadDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create download directory: %w", err)
-	}
-
-	// 获取匹配的远程文件列表
-	matchedFiles, err := s.findRemoteFiles(serverIP, remoteFilePath)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Printf("Found %d matching files on remote server", len(matchedFiles))
-
-	// 下载所有匹配的文件
-	var localPaths []string
-	timestamp := time.Now().Format("20060102150405")
-
-	for idx, remoteFile := range matchedFiles {
-		// 生成本地文件路径
-		fileName := filepath.Base(remoteFile)
-		localPath := filepath.Join(downloadDir, fmt.Sprintf("%s_%d_%s", timestamp, idx, fileName))
-
-		// 使用scp下载文件
-		cmd := exec.Command("scp", fmt.Sprintf("root@%s:%s", serverIP, remoteFile), localPath)
-		cmd.Stderr = os.Stderr
-
-		log.Printf("Downloading file %d/%d: %s -> %s", idx+1, len(matchedFiles), remoteFile, localPath)
-
-		if err := cmd.Run(); err != nil {
-			// 如果下载失败，清理已下载的文件
-			for _, path := range localPaths {
-				s.cleanupTempFile(path)
-			}
-			return nil, fmt.Errorf("failed to download file %s: %w", remoteFile, err)
-		}
-
-		localPaths = append(localPaths, localPath)
-	}
-
-	return localPaths, nil
-}
-
-// cleanupTempFile 清理临时文件
-func (s *DistributionService) cleanupTempFile(path string) {
-	if strings.Contains(path, "dmp_downloads") {
-		if err := os.Remove(path); err != nil {
-			log.Printf("Failed to cleanup temp file %s: %v", path, err)
-		} else {
-			log.Printf("Successfully cleaned up temp file: %s", path)
-		}
-	}
-}
-
 // streamProcessFile 流式处理大文件
 func (s *DistributionService) streamProcessFile(task *module.Distribution, processor func([]map[string]string) error) error {
 	var localPaths []string
@@ -309,8 +226,10 @@ func (s *DistributionService) streamProcessFile(task *module.Distribution, proce
 
 	// 检查是否是远程文件
 	if strings.HasPrefix(task.Path, "file://") {
-		// 下载远程文件
-		localPaths, err = s.downloadRemoteFile(task.Path)
+		// 下载远程文件 - scp 逻辑
+		//localPaths, err = s.downloadRemoteFile(task.Path)
+		// 下载远程文件 - api 接口下载
+		localPaths, err = s.downloadApiFile(task.Path)
 		if err != nil {
 			log.Printf("Failed to download remote files %s: %v", task.Path, err)
 			return fmt.Errorf("download files error: %w", err)
@@ -430,6 +349,176 @@ func (s *DistributionService) processBatch(task *module.Distribution, batch []ma
 		}
 	}
 	return nil
+}
+
+// findRemoteFiles 在远程服务器上查找匹配的文件
+func (s *DistributionService) findRemoteFiles(serverIP, remotePattern string) ([]string, error) {
+	// 使用ssh执行ls命令来获取匹配的文件列表
+	cmd := exec.Command("ssh", fmt.Sprintf("root@%s", serverIP), "ls -1", remotePattern)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list remote files: %w, cmd: %s", err, cmd.String())
+	}
+
+	// 解析输出得到文件列表
+	files := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(files) == 0 || (len(files) == 1 && files[0] == "") {
+		return nil, fmt.Errorf("no files found matching pattern: %s", remotePattern)
+	}
+
+	return files, nil
+}
+
+// downloadRemoteFile 下载远程文件到本地临时目录
+func (s *DistributionService) downloadRemoteFile(remotePath string) ([]string, error) {
+	// 解析远程文件路径
+	remotePath = strings.TrimPrefix(remotePath, "file:///")
+	log.Printf("Downloading remote file from path: %s", remotePath)
+	parts := strings.SplitN(remotePath, "/", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid remote file path: %s", remotePath)
+	}
+
+	serverIP := parts[0]
+	remoteFilePath := "/" + parts[1]
+
+	// 创建本地临时目录
+	tempDir := "./"
+	downloadDir := filepath.Join(tempDir, "dmp_downloads")
+	if err := os.MkdirAll(downloadDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create download directory: %w", err)
+	}
+
+	// 获取匹配的远程文件列表
+	matchedFiles, err := s.findRemoteFiles(serverIP, remoteFilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("Found %d matching files on remote server", len(matchedFiles))
+
+	// 下载所有匹配的文件
+	var localPaths []string
+	timestamp := time.Now().Format("20060102150405")
+
+	for idx, remoteFile := range matchedFiles {
+		// 生成本地文件路径
+		fileName := filepath.Base(remoteFile)
+		localPath := filepath.Join(downloadDir, fmt.Sprintf("%s_%d_%s", timestamp, idx, fileName))
+
+		// 使用scp下载文件
+		cmd := exec.Command("scp", fmt.Sprintf("root@%s:%s", serverIP, remoteFile), localPath)
+		cmd.Stderr = os.Stderr
+
+		log.Printf("Downloading file %d/%d: %s -> %s", idx+1, len(matchedFiles), remoteFile, localPath)
+
+		if err := cmd.Run(); err != nil {
+			// 如果下载失败，清理已下载的文件
+			for _, path := range localPaths {
+				s.cleanupTempFile(path)
+			}
+			return nil, fmt.Errorf("failed to download file %s: %w", remoteFile, err)
+		}
+
+		localPaths = append(localPaths, localPath)
+	}
+
+	return localPaths, nil
+}
+
+// downloadApiFile 通过API接口下载文件
+func (s *DistributionService) downloadApiFile(remotePath string) ([]string, error) {
+	// 解析远程文件路径
+	remotePath = strings.TrimPrefix(remotePath, "file:///")
+	log.Printf("Downloading files via API from path: %s", remotePath)
+	parts := strings.SplitN(remotePath, "/", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid remote file path: %s", remotePath)
+	}
+
+	serverIP := parts[0]
+	remotePrefix := "/" + parts[1]
+
+	// 获取文件列表
+	listURL := fmt.Sprintf("http://%s:6090/file/v1/download?prefix=%s", serverIP, remotePrefix)
+	resp, err := http.Get(listURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch file list: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch file list, status code: %d", resp.StatusCode)
+	}
+
+	var fileList struct {
+		Count int `json:"count"`
+		Files []struct {
+			Filename string `json:"filename"`
+			Path     string `json:"path"`
+			Size     int    `json:"size"`
+		} `json:"files"`
+		Status string `json:"status"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&fileList); err != nil {
+		return nil, fmt.Errorf("failed to decode file list response: %w", err)
+	}
+
+	if fileList.Status != "success" {
+		return nil, fmt.Errorf("failed to fetch file list, status: %s", fileList.Status)
+	}
+
+	log.Printf("Found %d files to download", fileList.Count)
+
+	// 下载文件到本地目录
+	tempDir := "./"
+	downloadDir := filepath.Join(tempDir, "dmp_downloads")
+	if err := os.MkdirAll(downloadDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create download directory: %w", err)
+	}
+
+	var localPaths []string
+	for _, file := range fileList.Files {
+		downloadURL := fmt.Sprintf("http://%s:6090/file/v1/download/file?path=%s", serverIP, file.Path)
+		localPath := filepath.Join(downloadDir, file.Filename)
+
+		resp, err := http.Get(downloadURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download file %s: %w", file.Path, err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("failed to download file %s, status code: %d", file.Path, resp.StatusCode)
+		}
+
+		out, err := os.Create(localPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create local file %s: %w", localPath, err)
+		}
+		defer out.Close()
+
+		if _, err := io.Copy(out, resp.Body); err != nil {
+			return nil, fmt.Errorf("failed to save file %s: %w", localPath, err)
+		}
+
+		localPaths = append(localPaths, localPath)
+		log.Printf("Successfully downloaded file: %s", localPath)
+	}
+
+	return localPaths, nil
+}
+
+// cleanupTempFile 清理临时文件
+func (s *DistributionService) cleanupTempFile(path string) {
+	if strings.Contains(path, "dmp_downloads") {
+		if err := os.Remove(path); err != nil {
+			log.Printf("Failed to cleanup temp file %s: %v", path, err)
+		} else {
+			log.Printf("Successfully cleaned up temp file: %s", path)
+		}
+	}
 }
 
 // parseLine 优化后的行解析

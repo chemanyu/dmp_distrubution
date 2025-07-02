@@ -46,12 +46,14 @@ func (a *Adn) Distribution(task *module.Distribution, batches []map[string]strin
 	// 计算明天的日期
 	tomorrow := now.AddDate(0, 0, 1).Format("2006-01-02")
 	expirationDate, err := time.Parse("2006-01-02", tomorrow)
+	expirationTime := expirationDate.AddDate(0, 0, 1) // eday=1 → 后天 0 点
+
 	if err != nil {
 		return fmt.Errorf("failed to parse expiration date: %v", err)
 	}
 
 	// 计算过期时间（秒）
-	expirationSeconds := int(expirationDate.Sub(now).Seconds())
+	expirationSeconds := int(expirationTime.Sub(expirationDate).Seconds())
 	crowdID := task.Crowd
 
 	// 批量处理所有设备
