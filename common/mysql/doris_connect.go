@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"dmp_distribution/core"
 	"fmt"
+	"log"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -17,16 +18,21 @@ func InitDoris() {
 	db, err := sql.Open("mysql", core.GetConfig().DORIS_DB+"?charset=utf8&multiStatements")
 	if err != nil {
 		panic(err.Error())
-		return
 	}
 	err = db.Ping()
 	if err != nil {
 		fmt.Println("Failed to connect to mysql, err:" + err.Error())
 		panic(err.Error())
-		return
 	}
 	db.SetMaxOpenConns(100)
 	db.SetMaxIdleConns(50)
 	db.SetConnMaxLifetime(60 * time.Second)
 	Doris = db
+}
+
+func GetConnectedDoris() *sql.DB {
+	if Doris == nil {
+		log.Panic("Database connection doris is not initialized. Call InitDoris() first")
+	}
+	return Doris
 }
