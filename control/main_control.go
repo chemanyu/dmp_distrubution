@@ -58,6 +58,8 @@ func init() {
 	// 初始化 Redis
 	redis.Mates.InitRedis(config.REDIS_POOL_DB)
 	cron.InitCronJobs()
+	// 初始化 Doris 数据库连接
+	mysqldb.InitDoris()
 }
 
 func MainControl() {
@@ -72,6 +74,7 @@ func MainControl() {
 
 	regHandlers := []handlers.Handler{
 		handlers.GetReportApiHandler,
+		handlers.UploadHandler,
 	}
 
 	// 注册路由

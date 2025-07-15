@@ -1,10 +1,10 @@
 package service
 
 import (
+	"bufio"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -99,7 +99,11 @@ func (s *UploadProcessorService) processRecord(record *module.UploadRecords) err
 
 	// 解析上传文件路径
 	var uploadData UploadFileData
-	if err := json.Unmarshal([]byte(record.UploadFilePaths), &uploadData); err != nil {
+	var unescaped string
+	if err := json.Unmarshal([]byte(record.UploadFilePaths), &unescaped); err != nil {
+		return fmt.Errorf("failed to unescape JSON: %w", err)
+	}
+	if err := json.Unmarshal([]byte(unescaped), &uploadData); err != nil {
 		return fmt.Errorf("failed to parse upload file paths: %w", err)
 	}
 
@@ -156,8 +160,8 @@ func (s *UploadProcessorService) processFilesByType(record *module.UploadRecords
 	for _, file := range files {
 		log.Printf("Processing %s file: %s", dataType, file.FileName)
 
-		// 创建临时表
-		tempTableName := fmt.Sprintf("temp_%s_%d_%d", dataType, record.ID, time.Now().Unix())
+		// 创建临时表 - 使用唯一的表名
+		tempTableName := fmt.Sprintf("temp_%s_%d_%d", dataType, record.ID, time.Now().UnixNano())
 		if err := s.createTempTable(tempTableName, dataType); err != nil {
 			return nil, fmt.Errorf("failed to create temp table: %w", err)
 		}
@@ -184,101 +188,146 @@ func (s *UploadProcessorService) processFilesByType(record *module.UploadRecords
 	return resultPaths, nil
 }
 
-// createTempTable 创建临时表
+// createTempTable 创建临时表 - 针对 Doris 优化
 func (s *UploadProcessorService) createTempTable(tableName, dataType string) error {
-	db := mysqldb.GetConnectedDoris()
+	dorisDB := mysqldb.Doris
+	if dorisDB == nil {
+		return fmt.Errorf("doris connection is not initialized")
+	}
 
 	var createSQL string
 	switch dataType {
 	case "imei":
 		createSQL = fmt.Sprintf(`
-			CREATE TEMPORARY TABLE %s (
-				id INT AUTO_INCREMENT PRIMARY KEY,
-				imei VARCHAR(255) NOT NULL,
-				INDEX idx_imei (imei)
-			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+			CREATE TABLE %s (
+				id BIGINT AUTO_INCREMENT,
+				imei VARCHAR(255) NOT NULL
+			) ENGINE=OLAP
+			DUPLICATE KEY(id)
+			DISTRIBUTED BY HASH(imei) BUCKETS 10
 		`, tableName)
 	case "oaid":
 		createSQL = fmt.Sprintf(`
-			CREATE TEMPORARY TABLE %s (
-				id INT AUTO_INCREMENT PRIMARY KEY,
-				oaid VARCHAR(255) NOT NULL,
-				INDEX idx_oaid (oaid)
-			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+			CREATE TABLE %s (
+				id BIGINT AUTO_INCREMENT,
+				oaid VARCHAR(255) NOT NULL
+			) ENGINE=OLAP
+			DUPLICATE KEY(id)
+			DISTRIBUTED BY HASH(oaid) BUCKETS 10
 		`, tableName)
 	case "caid":
 		createSQL = fmt.Sprintf(`
-			CREATE TEMPORARY TABLE %s (
-				id INT AUTO_INCREMENT PRIMARY KEY,
-				caid VARCHAR(255) NOT NULL,
-				INDEX idx_caid (caid)
-			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+			CREATE TABLE %s (
+				id BIGINT AUTO_INCREMENT,
+				caid VARCHAR(255) NOT NULL
+			) ENGINE=OLAP
+			DUPLICATE KEY(id)
+			DISTRIBUTED BY HASH(caid) BUCKETS 10
 		`, tableName)
 	case "idfa":
 		createSQL = fmt.Sprintf(`
-			CREATE TEMPORARY TABLE %s (
-				id INT AUTO_INCREMENT PRIMARY KEY,
-				idfa VARCHAR(255) NOT NULL,
-				INDEX idx_idfa (idfa)
-			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+			CREATE TABLE %s (
+				id BIGINT AUTO_INCREMENT,
+				idfa VARCHAR(255) NOT NULL
+			) ENGINE=OLAP
+			DUPLICATE KEY(id)
+			DISTRIBUTED BY HASH(idfa) BUCKETS 10
 		`, tableName)
 	default:
 		return fmt.Errorf("unsupported data type: %s", dataType)
 	}
 
-	result, err := db.Exec(createSQL)
+	_, err := dorisDB.Exec(createSQL)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create temp table: %w", err)
 	}
-	log.Printf("Created temporary table %s with result: %v", tableName, result)
+
+	log.Printf("Created temp table: %s", tableName)
 	return nil
 }
 
-// importFileToTempTable 导入文件数据到临时表
+// importFileToTempTable 导入文件数据到临时表 - 优化版本，支持大文件流式处理
 func (s *UploadProcessorService) importFileToTempTable(filePath, tableName, dataType string) error {
-	db := mysqldb.GetConnected()
+	startTime := time.Now()
+	dorisDB := mysqldb.Doris
+	if dorisDB == nil {
+		return fmt.Errorf("doris connection is not initialized")
+	}
 
-	// 读取文件内容
+	// 打开文件
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
 
-	content, err := io.ReadAll(file)
-	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
+	// 获取文件大小用于日志
+	fileInfo, _ := file.Stat()
+	fileSize := fileInfo.Size()
+
+	// 使用 bufio.Scanner 进行流式读取
+	scanner := bufio.NewScanner(file)
+
+	// 增加缓冲区大小以处理大文件
+	const maxCapacity = 1024 * 1024 // 1MB
+	buf := make([]byte, maxCapacity)
+	scanner.Buffer(buf, maxCapacity)
+
+	// 准备批量插入
+	batchSize := 5000 // 增加批次大小以提高性能
+	batch := make([]string, 0, batchSize)
+	totalLines := 0
+	batchCount := 0
+
+	// 预编译插入语句以提高性能
+	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES ", tableName, dataType)
+
+	log.Printf("Starting import of file %s (size: %d bytes) to table %s", filePath, fileSize, tableName)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		// 转义单引号防止SQL注入
+		escapedLine := strings.ReplaceAll(line, "'", "''")
+		batch = append(batch, fmt.Sprintf("('%s')", escapedLine))
+		totalLines++
+
+		// 当批次满了或者是最后一批时，执行插入
+		if len(batch) >= batchSize {
+			batchStart := time.Now()
+			if err := s.executeBatchInsert(dorisDB, insertSQL, batch); err != nil {
+				return fmt.Errorf("failed to insert batch %d at line %d: %w", batchCount+1, totalLines, err)
+			}
+			batchCount++
+			batch = batch[:0] // 清空批次但保留容量
+
+			// 记录批次处理时间
+			batchDuration := time.Since(batchStart)
+			if batchCount%10 == 0 { // 每10个批次记录一次
+				log.Printf("Processed %d batches, %d lines, batch duration: %v", batchCount, totalLines, batchDuration)
+			}
+		}
 	}
 
-	// 按行分割文件内容
-	lines := strings.Split(string(content), "\n")
-
-	// 批量插入数据
-	batchSize := 1000
-	for i := 0; i < len(lines); i += batchSize {
-		end := i + batchSize
-		if end > len(lines) {
-			end = len(lines)
+	// 处理剩余的数据
+	if len(batch) > 0 {
+		if err := s.executeBatchInsert(dorisDB, insertSQL, batch); err != nil {
+			return fmt.Errorf("failed to insert final batch: %w", err)
 		}
-
-		var values []string
-		for j := i; j < end; j++ {
-			line := strings.TrimSpace(lines[j])
-			if line == "" {
-				continue
-			}
-			values = append(values, fmt.Sprintf("('%s')", line))
-		}
-
-		if len(values) > 0 {
-			insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
-				tableName, dataType, strings.Join(values, ","))
-			if err := db.Exec(insertSQL).Error; err != nil {
-				return fmt.Errorf("failed to insert batch: %w", err)
-			}
-		}
+		batchCount++
 	}
 
+	// 检查扫描错误
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading file: %w", err)
+	}
+
+	duration := time.Since(startTime)
+	log.Printf("Successfully imported %d lines from file %s to table %s in %v (%d batches, avg %.2f lines/sec)",
+		totalLines, filePath, tableName, duration, batchCount, float64(totalLines)/duration.Seconds())
 	return nil
 }
 
@@ -440,9 +489,18 @@ func (s *UploadProcessorService) saveToCrowdUserBitmap(record *module.UploadReco
 
 // dropTempTable 删除临时表
 func (s *UploadProcessorService) dropTempTable(tableName string) {
-	db := mysqldb.GetConnected()
-	if err := db.Exec(fmt.Sprintf("DROP TEMPORARY TABLE IF EXISTS %s", tableName)).Error; err != nil {
+	dorisDB := mysqldb.Doris
+	if dorisDB == nil {
+		log.Printf("Doris connection is not initialized, cannot drop table %s", tableName)
+		return
+	}
+
+	// 为 Doris 使用 DROP TABLE 而不是 DROP TEMPORARY TABLE
+	dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)
+	if _, err := dorisDB.Exec(dropSQL); err != nil {
 		log.Printf("Failed to drop temp table %s: %v", tableName, err)
+	} else {
+		log.Printf("Successfully dropped temp table: %s", tableName)
 	}
 }
 
@@ -451,4 +509,56 @@ func (s *UploadProcessorService) IsRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.isRunning
+}
+
+// executeBatchInsert 执行批量插入操作，带重试机制
+func (s *UploadProcessorService) executeBatchInsert(db *sql.DB, insertSQL string, batch []string) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	// 构建完整的插入语句
+	fullSQL := insertSQL + strings.Join(batch, ",")
+
+	// 重试机制
+	maxRetries := 3
+	for retry := 0; retry < maxRetries; retry++ {
+		// 使用事务确保数据一致性
+		tx, err := db.Begin()
+		if err != nil {
+			if retry == maxRetries-1 {
+				return fmt.Errorf("failed to begin transaction after %d retries: %w", maxRetries, err)
+			}
+			log.Printf("Failed to begin transaction (retry %d/%d): %v", retry+1, maxRetries, err)
+			time.Sleep(time.Duration(retry+1) * time.Second)
+			continue
+		}
+
+		// 执行插入
+		_, err = tx.Exec(fullSQL)
+		if err != nil {
+			tx.Rollback()
+			if retry == maxRetries-1 {
+				return fmt.Errorf("failed to execute batch insert after %d retries: %w", maxRetries, err)
+			}
+			log.Printf("Failed to execute batch insert (retry %d/%d): %v", retry+1, maxRetries, err)
+			time.Sleep(time.Duration(retry+1) * time.Second)
+			continue
+		}
+
+		// 提交事务
+		if err := tx.Commit(); err != nil {
+			if retry == maxRetries-1 {
+				return fmt.Errorf("failed to commit transaction after %d retries: %w", maxRetries, err)
+			}
+			log.Printf("Failed to commit transaction (retry %d/%d): %v", retry+1, maxRetries, err)
+			time.Sleep(time.Duration(retry+1) * time.Second)
+			continue
+		}
+
+		// 成功执行，跳出重试循环
+		break
+	}
+
+	return nil
 }
