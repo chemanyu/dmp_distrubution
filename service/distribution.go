@@ -523,7 +523,7 @@ func (s *DistributionService) cleanupTempFile(path string) {
 
 // parseLine 优化后的行解析
 func (s *DistributionService) parseLine(line string, task *module.Distribution) (map[string]string, bool) {
-	fields := strings.Fields(line)
+	fields := strings.Split(line, "\t")
 	if len(fields) == 0 {
 		return nil, false
 	}
@@ -532,12 +532,12 @@ func (s *DistributionService) parseLine(line string, task *module.Distribution) 
 	if task.UserID == 1 {
 		deviceInfo["user_id"] = fields[1]
 	}
-	if task.Oaid == 1 {
+	if task.Oaid == 1 && len(fields) >= 2 {
 		if oaid := strings.TrimSpace(fields[2]); oaid != "" {
 			deviceInfo["oaid"] = oaid
 		}
 	}
-	if task.Caid == 1 {
+	if task.Caid == 1 && len(fields) >= 3 {
 		// 处理可能包含多个CAID的情况
 		if caids := strings.Split(fields[3], ","); len(caids) > 0 {
 			for i, caid := range caids {
@@ -547,12 +547,12 @@ func (s *DistributionService) parseLine(line string, task *module.Distribution) 
 			}
 		}
 	}
-	if task.Idfa == 1 {
+	if task.Idfa == 1 && len(fields) >= 4 {
 		if idfa := strings.TrimSpace(fields[4]); idfa != "" {
 			deviceInfo["idfa"] = idfa
 		}
 	}
-	if task.Imei == 1 {
+	if task.Imei == 1 && len(fields) >= 5 {
 		if imei := strings.TrimSpace(fields[5]); imei != "" {
 			deviceInfo["imei"] = imei
 		}
