@@ -35,9 +35,9 @@ func LoadConfig(cfg string) *Config {
 	viper.ReadInConfig()
 
 	config = &Config{
-		MYSQL_DB:          getViperStringValue("MYSQL_DB"),
-		DORIS_DB:          getViperStringValue("DORIS_DB"),
-		REDIS_DB:          getViperStringValue("REDIS_DB"),
+		MYSQL_DB: getViperStringValue("MYSQL_DB"),
+		//DORIS_DB:          getViperStringValue("DORIS_DB"),
+		//REDIS_DB:          getViperStringValue("REDIS_DB"),
 		REDIS_POOL_DB:     getViperStringValue("REDIS_POOL_DB"),
 		REDIS_POOL_DB_CRC: getViperStringValue("REDIS_POOL_DB_CRC"),
 		SERVER_PORT:       getViperStringValue("SERVER_PORT"),
