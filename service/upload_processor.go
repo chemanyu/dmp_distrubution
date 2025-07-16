@@ -200,43 +200,55 @@ func (s *UploadProcessorService) createTempTable(tableName, dataType string) err
 	case "imei":
 		createSQL = fmt.Sprintf(`
 			CREATE TABLE %s (
-				id BIGINT AUTO_INCREMENT,
+				id BIGINT NOT NULL AUTO_INCREMENT,
 				imei VARCHAR(255) NOT NULL
 			) ENGINE=OLAP
 			DUPLICATE KEY(id)
 			DISTRIBUTED BY HASH(imei) BUCKETS 10
+			PROPERTIES (
+				"replication_num" = "1"
+			);
 		`, tableName)
 	case "oaid":
 		createSQL = fmt.Sprintf(`
 			CREATE TABLE %s (
-				id BIGINT AUTO_INCREMENT,
+				id BIGINT NOT NULL AUTO_INCREMENT,
 				oaid VARCHAR(255) NOT NULL
 			) ENGINE=OLAP
 			DUPLICATE KEY(id)
 			DISTRIBUTED BY HASH(oaid) BUCKETS 10
+			PROPERTIES (
+				"replication_num" = "1"
+			);
 		`, tableName)
 	case "caid":
 		createSQL = fmt.Sprintf(`
 			CREATE TABLE %s (
-				id BIGINT AUTO_INCREMENT,
+				id BIGINT NOT NULL AUTO_INCREMENT,
 				caid VARCHAR(255) NOT NULL
 			) ENGINE=OLAP
 			DUPLICATE KEY(id)
 			DISTRIBUTED BY HASH(caid) BUCKETS 10
+			PROPERTIES (
+				"replication_num" = "1"
+			);
 		`, tableName)
 	case "idfa":
 		createSQL = fmt.Sprintf(`
 			CREATE TABLE %s (
-				id BIGINT AUTO_INCREMENT,
+				id BIGINT NOT NULL AUTO_INCREMENT,
 				idfa VARCHAR(255) NOT NULL
 			) ENGINE=OLAP
 			DUPLICATE KEY(id)
 			DISTRIBUTED BY HASH(idfa) BUCKETS 10
+			PROPERTIES (
+				"replication_num" = "1"
+			);
 		`, tableName)
 	default:
 		return fmt.Errorf("unsupported data type: %s", dataType)
 	}
-
+	log.Print("Creating temp table with SQL:", createSQL)
 	_, err := dorisDB.Exec(createSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create temp table: %w", err)

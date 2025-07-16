@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	mysqldb "dmp_distribution/common/mysql"
 	"dmp_distribution/module"
 	"dmp_distribution/platform"
 )
@@ -632,4 +633,133 @@ func (s *DistributionService) updateProgress(taskID int, delta int64) {
 
 	// 原子递增计数
 	atomic.AddInt64(&progress.currentCount, delta)
+}
+
+// processByStrategyID 通过StrategyID从Doris获取最新user_set，查mapping表，整理为batch推送redis
+func (s *DistributionService) processByStrategyID(task *module.Distribution, strategyID int64) error {
+	// 1. 查询dmp_crowd_user_bitmap表，获取最新event_date的user_set
+	query := `SELECT user_set FROM dmp_crowd_user_bitmap WHERE crowd_rule_ = ? ORDER BY event_date DESC LIMIT 1`
+	var userSetBitmap []byte
+
+	// 使用Doris连接
+	dorisDB := mysqldb.Doris
+	if dorisDB == nil {
+		return fmt.Errorf("doris connection is not initialized")
+	}
+
+	err := dorisDB.QueryRow(query, strategyID).Scan(&userSetBitmap)
+	if err != nil {
+		return fmt.Errorf("query user_set bitmap error: %w", err)
+	}
+
+	// 2. 解析bitmap，得到hash_id列表
+	hashIDs, err := s.parseBitmapToHashIDs(userSetBitmap)
+	if err != nil {
+		return fmt.Errorf("parse bitmap error: %w", err)
+	}
+
+	if len(hashIDs) == 0 {
+		log.Printf("No hash_id found for strategyID %d", strategyID)
+		return nil
+	}
+
+	log.Printf("Found %d hash_ids for strategyID %d", len(hashIDs), strategyID)
+
+	// 3. 批量查dmp_user_mapping_v2表，获取参数
+	batchSize := StreamBatchSize
+	totalProcessed := 0
+
+	for i := 0; i < len(hashIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(hashIDs) {
+			end = len(hashIDs)
+		}
+		batchIDs := hashIDs[i:end]
+
+		// 构造IN查询
+		placeholders := strings.Repeat(",?", len(batchIDs)-1)
+		mappingQuery := fmt.Sprintf(`SELECT hash_id, user_id, oaid, caid, idfa, imei FROM dmp_user_mapping_v2 WHERE hash_id IN (?%s)`, placeholders)
+
+		args := make([]interface{}, len(batchIDs))
+		for j, id := range batchIDs {
+			args[j] = id
+		}
+
+		rows, err := dorisDB.Query(mappingQuery, args...)
+		if err != nil {
+			return fmt.Errorf("query mapping error: %w", err)
+		}
+
+		var batch []map[string]string
+		for rows.Next() {
+			var hashID int64
+			var userID, oaid, caid, idfa, imei string
+
+			if err := rows.Scan(&hashID, &userID, &oaid, &caid, &idfa, &imei); err != nil {
+				log.Printf("Scan error: %v", err)
+				continue
+			}
+
+			item := make(map[string]string)
+
+			if task.UserID == 1 && userID != "" {
+				item["user_id"] = userID
+			}
+			if task.Oaid == 1 && oaid != "" {
+				item["oaid"] = oaid
+			}
+			if task.Caid == 1 && caid != "" {
+				// 支持多个caid
+				caids := strings.Split(caid, ",")
+				for k, c := range caids {
+					c = strings.TrimSpace(c)
+					if c != "" {
+						item[fmt.Sprintf("caid_%d", k+1)] = c
+					}
+				}
+			}
+			if task.Idfa == 1 && idfa != "" {
+				item["idfa"] = idfa
+			}
+			if task.Imei == 1 && imei != "" {
+				item["imei"] = imei
+			}
+
+			if len(item) > 0 {
+				batch = append(batch, item)
+			}
+		}
+		rows.Close()
+
+		if len(batch) > 0 {
+			if err := s.processBatch(task, batch); err != nil {
+				return fmt.Errorf("redis batch push error: %w", err)
+			}
+			totalProcessed += len(batch)
+		}
+	}
+
+	log.Printf("Successfully processed %d records for strategyID %d", totalProcessed, strategyID)
+	return nil
+}
+
+// parseBitmapToHashIDs 解析bitmap得到hash_id列表
+func (s *DistributionService) parseBitmapToHashIDs(bitmap []byte) ([]int64, error) {
+	// TODO: 实现bitmap解析逻辑
+	// 这里需要根据你们的bitmap格式进行解析
+	// 示例代码，需要根据实际bitmap格式调整
+
+	var hashIDs []int64
+
+	// 如果bitmap是简单的位图格式，可以按位解析
+	for i := 0; i < len(bitmap)*8; i++ {
+		byteIndex := i / 8
+		bitIndex := i % 8
+
+		if byteIndex < len(bitmap) && (bitmap[byteIndex]&(1<<bitIndex)) != 0 {
+			hashIDs = append(hashIDs, int64(i))
+		}
+	}
+
+	return hashIDs, nil
 }
