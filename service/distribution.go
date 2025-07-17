@@ -1,16 +1,9 @@
 package service
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -207,17 +200,98 @@ func (s *DistributionService) processTask(task *module.Distribution) error {
 	}
 
 	// 2. 流式处理文件
-	processor := func(batch []map[string]string) error {
-		return s.processBatch(task, batch)
-	}
+	// processor := func(batch []map[string]string) error {
+	// 	return s.processBatch(task, batch)
+	// }
 
-	if err := s.streamProcessFile(task, processor); err != nil {
+	// if err := s.streamProcessFile(task, processor); err != nil {
+	// 	s.finalizeTask(task, TaskFailStatus, err)
+	// 	return err
+	// }
+
+	// 处理策略ID分发
+	if err := s.processByStrategyID(task, int64(task.StrategyID)); err != nil {
 		s.finalizeTask(task, TaskFailStatus, err)
 		return err
 	}
 
 	// 3. 最终状态更新
 	return s.finalizeTask(task, TaskDoneStatus, nil)
+}
+
+// findRemoteFiles 在远程服务器上查找匹配的文件
+/*func (s *DistributionService) findRemoteFiles(serverIP, remotePattern string) ([]string, error) {
+	// 使用ssh执行ls命令来获取匹配的文件列表
+	cmd := exec.Command("ssh", fmt.Sprintf("root@%s", serverIP), "ls -1", remotePattern)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list remote files: %w, cmd: %s", err, cmd.String())
+	}
+
+	// 解析输出得到文件列表
+	files := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(files) == 0 || (len(files) == 1 && files[0] == "") {
+		return nil, fmt.Errorf("no files found matching pattern: %s", remotePattern)
+	}
+
+	return files, nil
+}
+
+// downloadRemoteFile scp下载远程文件到本地临时目录
+func (s *DistributionService) downloadRemoteFile(remotePath string) ([]string, error) {
+	// 解析远程文件路径
+	remotePath = strings.TrimPrefix(remotePath, "file:///")
+	log.Printf("Downloading remote file from path: %s", remotePath)
+	parts := strings.SplitN(remotePath, "/", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid remote file path: %s", remotePath)
+	}
+
+	serverIP := parts[0]
+	remoteFilePath := "/" + parts[1]
+
+	// 创建本地临时目录
+	tempDir := "./"
+	downloadDir := filepath.Join(tempDir, "dmp_downloads")
+	if err := os.MkdirAll(downloadDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create download directory: %w", err)
+	}
+
+	// 获取匹配的远程文件列表
+	matchedFiles, err := s.findRemoteFiles(serverIP, remoteFilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("Found %d matching files on remote server", len(matchedFiles))
+
+	// 下载所有匹配的文件
+	var localPaths []string
+	timestamp := time.Now().Format("20060102150405")
+
+	for idx, remoteFile := range matchedFiles {
+		// 生成本地文件路径
+		fileName := filepath.Base(remoteFile)
+		localPath := filepath.Join(downloadDir, fmt.Sprintf("%s_%d_%s", timestamp, idx, fileName))
+
+		// 使用scp下载文件
+		cmd := exec.Command("scp", fmt.Sprintf("root@%s:%s", serverIP, remoteFile), localPath)
+		cmd.Stderr = os.Stderr
+
+		log.Printf("Downloading file %d/%d: %s -> %s", idx+1, len(matchedFiles), remoteFile, localPath)
+
+		if err := cmd.Run(); err != nil {
+			// 如果下载失败，清理已下载的文件
+			for _, path := range localPaths {
+				s.cleanupTempFile(path)
+			}
+			return nil, fmt.Errorf("failed to download file %s: %w", remoteFile, err)
+		}
+
+		localPaths = append(localPaths, localPath)
+	}
+
+	return localPaths, nil
 }
 
 // streamProcessFile 流式处理大文件
@@ -319,112 +393,6 @@ func (s *DistributionService) streamProcessFile(task *module.Distribution, proce
 	s.flushProgress()
 
 	return nil
-}
-
-// processBatch 处理单个批次
-func (s *DistributionService) processBatch(task *module.Distribution, batch []map[string]string) error {
-	platformServers, err := platform.Servers.Get(task.Platform)
-	if err != nil {
-		return fmt.Errorf("get platform servers error: %w", err)
-	}
-	defer platform.Servers.Put(task.Platform, platformServers)
-
-	// 分批提交到Redis
-	for i := 0; i < len(batch); i += RedisBatchSize {
-		end := i + RedisBatchSize
-		if end > len(batch) {
-			end = len(batch)
-		}
-
-		retry := 0
-		for retry <= RetryMaxTimes {
-			if err := platformServers.Distribution(task, batch[i:end]); err == nil {
-				break
-			}
-			retry++
-			time.Sleep(time.Second * time.Duration(retry))
-		}
-
-		if retry > RetryMaxTimes {
-			return fmt.Errorf("max retries exceeded for batch %d-%d", i, end)
-		}
-	}
-	return nil
-}
-
-// findRemoteFiles 在远程服务器上查找匹配的文件
-func (s *DistributionService) findRemoteFiles(serverIP, remotePattern string) ([]string, error) {
-	// 使用ssh执行ls命令来获取匹配的文件列表
-	cmd := exec.Command("ssh", fmt.Sprintf("root@%s", serverIP), "ls -1", remotePattern)
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list remote files: %w, cmd: %s", err, cmd.String())
-	}
-
-	// 解析输出得到文件列表
-	files := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(files) == 0 || (len(files) == 1 && files[0] == "") {
-		return nil, fmt.Errorf("no files found matching pattern: %s", remotePattern)
-	}
-
-	return files, nil
-}
-
-// downloadRemoteFile 下载远程文件到本地临时目录
-func (s *DistributionService) downloadRemoteFile(remotePath string) ([]string, error) {
-	// 解析远程文件路径
-	remotePath = strings.TrimPrefix(remotePath, "file:///")
-	log.Printf("Downloading remote file from path: %s", remotePath)
-	parts := strings.SplitN(remotePath, "/", 2)
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid remote file path: %s", remotePath)
-	}
-
-	serverIP := parts[0]
-	remoteFilePath := "/" + parts[1]
-
-	// 创建本地临时目录
-	tempDir := "./"
-	downloadDir := filepath.Join(tempDir, "dmp_downloads")
-	if err := os.MkdirAll(downloadDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create download directory: %w", err)
-	}
-
-	// 获取匹配的远程文件列表
-	matchedFiles, err := s.findRemoteFiles(serverIP, remoteFilePath)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Printf("Found %d matching files on remote server", len(matchedFiles))
-
-	// 下载所有匹配的文件
-	var localPaths []string
-	timestamp := time.Now().Format("20060102150405")
-
-	for idx, remoteFile := range matchedFiles {
-		// 生成本地文件路径
-		fileName := filepath.Base(remoteFile)
-		localPath := filepath.Join(downloadDir, fmt.Sprintf("%s_%d_%s", timestamp, idx, fileName))
-
-		// 使用scp下载文件
-		cmd := exec.Command("scp", fmt.Sprintf("root@%s:%s", serverIP, remoteFile), localPath)
-		cmd.Stderr = os.Stderr
-
-		log.Printf("Downloading file %d/%d: %s -> %s", idx+1, len(matchedFiles), remoteFile, localPath)
-
-		if err := cmd.Run(); err != nil {
-			// 如果下载失败，清理已下载的文件
-			for _, path := range localPaths {
-				s.cleanupTempFile(path)
-			}
-			return nil, fmt.Errorf("failed to download file %s: %w", remoteFile, err)
-		}
-
-		localPaths = append(localPaths, localPath)
-	}
-
-	return localPaths, nil
 }
 
 // downloadApiFile 通过API接口下载文件
@@ -560,6 +528,7 @@ func (s *DistributionService) parseLine(line string, task *module.Distribution) 
 	}
 	return deviceInfo, len(deviceInfo) > 0
 }
+*/
 
 // initTaskStatus 任务初始化
 func (s *DistributionService) initTaskStatus(task *module.Distribution) error {
@@ -569,6 +538,190 @@ func (s *DistributionService) initTaskStatus(task *module.Distribution) error {
 	// 初始化行数为0
 	if err := s.distModel.UpdateLineCount(task.ID, 0); err != nil {
 		return fmt.Errorf("init line count error: %w", err)
+	}
+	return nil
+}
+
+// processByStrategyID 通过StrategyID从Doris获取最新user_set，查mapping表，整理为batch推送redis，并兼容进度/状态
+func (s *DistributionService) processByStrategyID(task *module.Distribution, strategyID int64) error {
+	dorisDB := mysqldb.Doris
+	if dorisDB == nil {
+		return fmt.Errorf("doris connection is not initialized")
+	}
+
+	// 查 hash_id 范围
+	var minHashID, maxHashID int64
+	rangeQuery := `SELECT MIN(hash_id), MAX(hash_id) FROM dmp_user_mapping_v2`
+	if err := dorisDB.QueryRow(rangeQuery).Scan(&minHashID, &maxHashID); err != nil {
+		return fmt.Errorf("query hash_id range error: %w", err)
+	}
+	log.Printf("hash_id range: [%d, %d]", minHashID, maxHashID)
+
+	// 分区并发查，避免OFFSET
+	const partitionSize = int64(50000000) // 每分区5000万，可根据资源调整
+	const maxConcurrency = 8              // 最大并发数
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrency)
+	var firstErr error
+	var mu sync.Mutex
+
+	for start := minHashID; start <= maxHashID; start += partitionSize {
+		end := start + partitionSize
+		if end > maxHashID+1 {
+			end = maxHashID + 1
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(start, end int64) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			var selectFields []string
+			var scanFields []interface{}
+			var userID, oaid, caid, idfa, imei string
+			if task.UserID == 1 {
+				selectFields = append(selectFields, "user_id")
+				scanFields = append(scanFields, &userID)
+			}
+			if task.Oaid == 1 {
+				selectFields = append(selectFields, "oaid")
+				scanFields = append(scanFields, &oaid)
+			}
+			if task.Caid == 1 {
+				selectFields = append(selectFields, "caid")
+				scanFields = append(scanFields, &caid)
+			}
+			if task.Idfa == 1 {
+				selectFields = append(selectFields, "idfa")
+				scanFields = append(scanFields, &idfa)
+			}
+			if task.Imei == 1 {
+				selectFields = append(selectFields, "imei")
+				scanFields = append(scanFields, &imei)
+			}
+
+			query := fmt.Sprintf(`SELECT %s FROM dmp_user_mapping_v2 
+				WHERE hash_id >= ? AND hash_id < ? AND bitmap_contains(
+					(SELECT user_set FROM dmp_crowd_user_bitmap WHERE crowd_rule_id = ? ORDER BY event_date DESC LIMIT 1),
+                	hash_id
+				)`,
+				strings.Join(selectFields, ", "))
+			log.Printf("Executing query: %s with range [%d, %d) and strategyID %d", query, start, end, strategyID)
+			rows, err := dorisDB.Query(query, start, end, strategyID)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("query mapping error in range [%d,%d): %w", start, end, err)
+				}
+				mu.Unlock()
+				return
+			}
+			defer rows.Close()
+
+			batch := make([]map[string]string, 0, StreamBatchSize)
+			processed := 0
+			for rows.Next() {
+				if err := rows.Scan(scanFields...); err != nil {
+					log.Printf("Scan error: %v", err)
+					continue
+				}
+				item := make(map[string]string)
+				if task.UserID == 1 && userID != "" {
+					item["user_id"] = userID
+				}
+				if task.Oaid == 1 && oaid != "" {
+					item["oaid"] = oaid
+				}
+				if task.Caid == 1 && caid != "" {
+					caids := strings.Split(caid, ",")
+					for k, c := range caids {
+						c = strings.TrimSpace(c)
+						if c != "" {
+							item[fmt.Sprintf("caid_%d", k+1)] = c
+						}
+					}
+				}
+				if task.Idfa == 1 && idfa != "" {
+					item["idfa"] = idfa
+				}
+				if task.Imei == 1 && imei != "" {
+					item["imei"] = imei
+				}
+				if len(item) > 0 {
+					batch = append(batch, item)
+				}
+				if len(batch) >= StreamBatchSize {
+					if err := s.processBatch(task, batch); err != nil {
+						mu.Lock()
+						if firstErr == nil {
+							firstErr = fmt.Errorf("redis batch push error: %w", err)
+						}
+						mu.Unlock()
+						return
+					}
+					processed += len(batch)
+					batch = batch[:0]
+					// 进度更新
+					s.updateProgress(task.ID, int64(StreamBatchSize))
+				}
+			}
+			if len(batch) > 0 {
+				if err := s.processBatch(task, batch); err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("redis batch push error: %w", err)
+					}
+					mu.Unlock()
+					return
+				}
+				processed += len(batch)
+				// 进度更新
+				s.updateProgress(task.ID, int64(len(batch)))
+			}
+			log.Printf("Processed %d records for hash_id range [%d, %d)", processed, start, end)
+		}(start, end)
+	}
+	wg.Wait()
+
+	// 分区全部完成后，刷新进度
+	s.flushProgress()
+
+	if firstErr != nil {
+		s.finalizeTask(task, TaskFailStatus, firstErr)
+		return firstErr
+	}
+
+	s.finalizeTask(task, TaskDoneStatus, nil)
+	return nil
+}
+
+// processBatch 处理单个批次
+func (s *DistributionService) processBatch(task *module.Distribution, batch []map[string]string) error {
+	platformServers, err := platform.Servers.Get(task.Platform)
+	if err != nil {
+		return fmt.Errorf("get platform servers error: %w", err)
+	}
+	defer platform.Servers.Put(task.Platform, platformServers)
+
+	// 分批提交到Redis
+	for i := 0; i < len(batch); i += RedisBatchSize {
+		end := i + RedisBatchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+
+		retry := 0
+		for retry <= RetryMaxTimes {
+			if err := platformServers.Distribution(task, batch[i:end]); err == nil {
+				break
+			}
+			retry++
+			time.Sleep(time.Second * time.Duration(retry))
+		}
+
+		if retry > RetryMaxTimes {
+			return fmt.Errorf("max retries exceeded for batch %d-%d", i, end)
+		}
 	}
 	return nil
 }
@@ -633,133 +786,4 @@ func (s *DistributionService) updateProgress(taskID int, delta int64) {
 
 	// 原子递增计数
 	atomic.AddInt64(&progress.currentCount, delta)
-}
-
-// processByStrategyID 通过StrategyID从Doris获取最新user_set，查mapping表，整理为batch推送redis
-func (s *DistributionService) processByStrategyID(task *module.Distribution, strategyID int64) error {
-	// 1. 查询dmp_crowd_user_bitmap表，获取最新event_date的user_set
-	query := `SELECT user_set FROM dmp_crowd_user_bitmap WHERE crowd_rule_ = ? ORDER BY event_date DESC LIMIT 1`
-	var userSetBitmap []byte
-
-	// 使用Doris连接
-	dorisDB := mysqldb.Doris
-	if dorisDB == nil {
-		return fmt.Errorf("doris connection is not initialized")
-	}
-
-	err := dorisDB.QueryRow(query, strategyID).Scan(&userSetBitmap)
-	if err != nil {
-		return fmt.Errorf("query user_set bitmap error: %w", err)
-	}
-
-	// 2. 解析bitmap，得到hash_id列表
-	hashIDs, err := s.parseBitmapToHashIDs(userSetBitmap)
-	if err != nil {
-		return fmt.Errorf("parse bitmap error: %w", err)
-	}
-
-	if len(hashIDs) == 0 {
-		log.Printf("No hash_id found for strategyID %d", strategyID)
-		return nil
-	}
-
-	log.Printf("Found %d hash_ids for strategyID %d", len(hashIDs), strategyID)
-
-	// 3. 批量查dmp_user_mapping_v2表，获取参数
-	batchSize := StreamBatchSize
-	totalProcessed := 0
-
-	for i := 0; i < len(hashIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(hashIDs) {
-			end = len(hashIDs)
-		}
-		batchIDs := hashIDs[i:end]
-
-		// 构造IN查询
-		placeholders := strings.Repeat(",?", len(batchIDs)-1)
-		mappingQuery := fmt.Sprintf(`SELECT hash_id, user_id, oaid, caid, idfa, imei FROM dmp_user_mapping_v2 WHERE hash_id IN (?%s)`, placeholders)
-
-		args := make([]interface{}, len(batchIDs))
-		for j, id := range batchIDs {
-			args[j] = id
-		}
-
-		rows, err := dorisDB.Query(mappingQuery, args...)
-		if err != nil {
-			return fmt.Errorf("query mapping error: %w", err)
-		}
-
-		var batch []map[string]string
-		for rows.Next() {
-			var hashID int64
-			var userID, oaid, caid, idfa, imei string
-
-			if err := rows.Scan(&hashID, &userID, &oaid, &caid, &idfa, &imei); err != nil {
-				log.Printf("Scan error: %v", err)
-				continue
-			}
-
-			item := make(map[string]string)
-
-			if task.UserID == 1 && userID != "" {
-				item["user_id"] = userID
-			}
-			if task.Oaid == 1 && oaid != "" {
-				item["oaid"] = oaid
-			}
-			if task.Caid == 1 && caid != "" {
-				// 支持多个caid
-				caids := strings.Split(caid, ",")
-				for k, c := range caids {
-					c = strings.TrimSpace(c)
-					if c != "" {
-						item[fmt.Sprintf("caid_%d", k+1)] = c
-					}
-				}
-			}
-			if task.Idfa == 1 && idfa != "" {
-				item["idfa"] = idfa
-			}
-			if task.Imei == 1 && imei != "" {
-				item["imei"] = imei
-			}
-
-			if len(item) > 0 {
-				batch = append(batch, item)
-			}
-		}
-		rows.Close()
-
-		if len(batch) > 0 {
-			if err := s.processBatch(task, batch); err != nil {
-				return fmt.Errorf("redis batch push error: %w", err)
-			}
-			totalProcessed += len(batch)
-		}
-	}
-
-	log.Printf("Successfully processed %d records for strategyID %d", totalProcessed, strategyID)
-	return nil
-}
-
-// parseBitmapToHashIDs 解析bitmap得到hash_id列表
-func (s *DistributionService) parseBitmapToHashIDs(bitmap []byte) ([]int64, error) {
-	// TODO: 实现bitmap解析逻辑
-	// 这里需要根据你们的bitmap格式进行解析
-	// 示例代码，需要根据实际bitmap格式调整
-
-	var hashIDs []int64
-
-	// 如果bitmap是简单的位图格式，可以按位解析
-	for i := 0; i < len(bitmap)*8; i++ {
-		byteIndex := i / 8
-		bitIndex := i % 8
-
-		if byteIndex < len(bitmap) && (bitmap[byteIndex]&(1<<bitIndex)) != 0 {
-			hashIDs = append(hashIDs, int64(i))
-		}
-	}
-
-	return hashIDs, nil
 }
