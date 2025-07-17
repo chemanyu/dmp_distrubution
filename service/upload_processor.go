@@ -13,6 +13,7 @@ import (
 	"time"
 
 	mysqldb "dmp_distribution/common/mysql"
+	"dmp_distribution/core"
 	"dmp_distribution/module"
 )
 
@@ -343,92 +344,8 @@ func (s *UploadProcessorService) importFileToTempTable(filePath, tableName, data
 	return nil
 }
 
-// matchDataAndGenerateFile 匹配数据并生成文件
+// matchDataAndGenerateFile 匹配数据并生成文件 - 使用 Doris INTO OUTFILE 直接导出
 func (s *UploadProcessorService) matchDataAndGenerateFile(record *module.UploadRecords, tempTableName, dataType string) (string, error) {
-	// 从 doris 查询匹配的数据
-	matchedData, err := s.queryMatchedDataFromDoris(tempTableName, dataType)
-	if err != nil {
-		return "", fmt.Errorf("failed to query matched data from doris: %w", err)
-	}
-
-	// 生成结果文件
-	resultPath, err := s.generateResultFile(record, matchedData, dataType)
-	if err != nil {
-		return "", fmt.Errorf("failed to generate result file: %w", err)
-	}
-
-	// 保存 hash_id 到 dmp_crowd_user_bitmap
-	if err := s.saveToCrowdUserBitmap(record, matchedData); err != nil {
-		return "", fmt.Errorf("failed to save to crowd user bitmap: %w", err)
-	}
-
-	return resultPath, nil
-}
-
-// queryMatchedDataFromDoris 从 doris 查询匹配的数据
-func (s *UploadProcessorService) queryMatchedDataFromDoris(tempTableName, dataType string) ([]map[string]interface{}, error) {
-	dorisDB := mysqldb.Doris
-	if dorisDB == nil {
-		return nil, fmt.Errorf("doris connection is not initialized")
-	}
-
-	var querySQL string
-	switch dataType {
-	case "imei":
-		querySQL = fmt.Sprintf(`
-			SELECT d.hash_id, d.user_id, d.imei
-			FROM dmp_user_mapping_v2 d
-			INNER JOIN %s t ON d.imei = t.imei
-		`, tempTableName)
-	case "oaid":
-		querySQL = fmt.Sprintf(`
-			SELECT d.hash_id, d.user_id, d.oaid
-			FROM dmp_user_mapping_v2 d
-			INNER JOIN %s t ON d.oaid = t.oaid
-		`, tempTableName)
-	case "caid":
-		querySQL = fmt.Sprintf(`
-			SELECT d.hash_id, d.user_id, d.caid
-			FROM dmp_user_mapping_v2 d
-			INNER JOIN %s t ON d.caid = t.caid
-		`, tempTableName)
-	case "idfa":
-		querySQL = fmt.Sprintf(`
-			SELECT d.hash_id, d.user_id, d.idfa
-			FROM dmp_user_mapping_v2 d
-			INNER JOIN %s t ON d.idfa = t.idfa
-		`, tempTableName)
-	default:
-		return nil, fmt.Errorf("unsupported data type: %s", dataType)
-	}
-
-	rows, err := dorisDB.Query(querySQL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query doris: %w", err)
-	}
-	defer rows.Close()
-
-	var results []map[string]interface{}
-	for rows.Next() {
-		var hashID, userID, deviceID sql.NullString
-		if err := rows.Scan(&hashID, &userID, &deviceID); err != nil {
-			return nil, fmt.Errorf("failed to scan row: %w", err)
-		}
-
-		result := map[string]interface{}{
-			"hash_id":   hashID.String,
-			"user_id":   userID.String,
-			"device_id": deviceID.String,
-			"type":      dataType,
-		}
-		results = append(results, result)
-	}
-
-	return results, nil
-}
-
-// generateResultFile 生成结果文件
-func (s *UploadProcessorService) generateResultFile(record *module.UploadRecords, data []map[string]interface{}, dataType string) (string, error) {
 	// 创建结果文件目录
 	resultDir := filepath.Join("results", fmt.Sprintf("%d", record.ID))
 	if err := os.MkdirAll(resultDir, 0755); err != nil {
@@ -437,66 +354,152 @@ func (s *UploadProcessorService) generateResultFile(record *module.UploadRecords
 
 	// 生成结果文件名
 	timestamp := time.Now().Format("20060102150405")
-	resultFileName := fmt.Sprintf("%s_%s_%s.txt", record.FileName, dataType, timestamp)
-	resultPath := filepath.Join(resultDir, resultFileName)
+	resultFileName := fmt.Sprintf("upload_%s_%s.csv", dataType, timestamp)
 
-	// 创建结果文件
-	file, err := os.Create(resultPath)
+	// 使用 Doris INTO OUTFILE 直接导出数据，返回file:///ip/路径
+	fileURL, err := s.exportDataToFileDirectly(tempTableName, dataType, resultFileName)
 	if err != nil {
-		return "", fmt.Errorf("failed to create result file: %w", err)
-	}
-	defer file.Close()
-
-	// 写入数据
-	for _, row := range data {
-		line := fmt.Sprintf("%s\t%s\t%s\n",
-			row["hash_id"], row["user_id"], row["device_id"])
-		if _, err := file.WriteString(line); err != nil {
-			return "", fmt.Errorf("failed to write to result file: %w", err)
-		}
+		return "", fmt.Errorf("failed to export data to file: %w", err)
 	}
 
-	log.Printf("Generated result file: %s with %d records", resultPath, len(data))
-	return resultPath, nil
-}
-
-// saveToCrowdUserBitmap 保存到人群用户位图
-func (s *UploadProcessorService) saveToCrowdUserBitmap(record *module.UploadRecords, data []map[string]interface{}) error {
+	// 直接聚合插入 bitmap
 	dorisDB := mysqldb.Doris
 	if dorisDB == nil {
-		return fmt.Errorf("doris connection is not initialized")
+		return "", fmt.Errorf("doris connection is not initialized")
+	}
+	eventDate := time.Now().Format("2006-01-02 15:04:05")
+	var joinField string
+	switch dataType {
+	case "imei":
+		joinField = "imei"
+	case "oaid":
+		joinField = "oaid"
+	case "caid":
+		joinField = "caid"
+	case "idfa":
+		joinField = "idfa"
+	case "user_id":
+		joinField = "user_id"
+	default:
+		return "", fmt.Errorf("unsupported data type: %s", dataType)
+	}
+	insertSQL := fmt.Sprintf(`
+		INSERT INTO dmp_crowd_user_bitmap (crowd_rule_id, event_date, user_set)
+		SELECT %d, '%s', bitmap_union(to_bitmap(d.hash_id))
+		FROM dmp_user_mapping_v2 d
+		INNER JOIN %s t ON d.%s = t.%s
+	`, record.ID, eventDate, tempTableName, joinField, joinField)
+	log.Printf("Inserting bitmap_union directly: %s", insertSQL)
+	if _, err := dorisDB.Exec(insertSQL); err != nil {
+		return "", fmt.Errorf("failed to insert bitmap_union: %w", err)
 	}
 
-	// 批量插入到 dmp_crowd_user_bitmap
-	batchSize := 1000
-	for i := 0; i < len(data); i += batchSize {
-		end := i + batchSize
-		if end > len(data) {
-			end = len(data)
-		}
+	return fileURL, nil
+}
 
-		var values []string
-		for j := i; j < end; j++ {
-			// 假设 crowd_id 来自 record.ID，event_date 为今天
-			eventDate := time.Now().Format("2006-01-02")
-			values = append(values, fmt.Sprintf("(%d, '%s', b'1')",
-				record.ID, eventDate))
-		}
-
-		if len(values) > 0 {
-			insertSQL := fmt.Sprintf(`
-				INSERT INTO dmp_crowd_user_bitmap (crowd_id, event_date, user_set) 
-				VALUES %s
-			`, strings.Join(values, ","))
-
-			if _, err := dorisDB.Exec(insertSQL); err != nil {
-				return fmt.Errorf("failed to insert into crowd user bitmap: %w", err)
-			}
-		}
+// exportDataToFileDirectly 使用 Doris INTO OUTFILE 直接导出数据到文件，并返回带Doris IP的file:///地址
+func (s *UploadProcessorService) exportDataToFileDirectly(tempTableName, dataType, resultPath string) (string, error) {
+	dorisDB := mysqldb.Doris
+	if dorisDB == nil {
+		return "", fmt.Errorf("doris connection is not initialized")
 	}
 
-	log.Printf("Saved %d hash_ids to dmp_crowd_user_bitmap for record %d", len(data), record.ID)
-	return nil
+	// 获取Doris IP
+	dorisIP := core.GetConfig().DORIS_IP
+	if dorisIP == "" {
+		return "", fmt.Errorf("failed to parse doris ip from IP: %s", dorisIP)
+	}
+
+	// 构建查询SQL，使用 INTO OUTFILE 直接导出
+	var exportSQL string
+	switch dataType {
+	case "user_id":
+		exportSQL = fmt.Sprintf(`
+			SELECT d.hash_id, d.user_id, d.oaid, d.caid, d.idfa, d.imei
+			FROM dmp_user_mapping_v2 d
+			INNER JOIN %s t ON d.user_id = t.user_id
+			INTO OUTFILE "file:///tmp/"
+			PROPERTIES (
+				"column_separator" = "\t",
+				"line_delimiter" = "\n"
+			)
+		`, tempTableName)
+	case "imei":
+		exportSQL = fmt.Sprintf(`
+			SELECT d.hash_id, d.user_id, d.oaid, d.caid, d.idfa, d.imei
+			FROM dmp_user_mapping_v2 d
+			INNER JOIN %s t ON d.imei = t.imei
+			INTO OUTFILE "file:///tmp/"
+			PROPERTIES (
+				"column_separator" = "\t",
+				"line_delimiter" = "\n"
+			)
+		`, tempTableName)
+	case "oaid":
+		exportSQL = fmt.Sprintf(`
+			SELECT d.hash_id, d.user_id, d.oaid, d.caid, d.idfa, d.imei
+			FROM dmp_user_mapping_v2 d
+			INNER JOIN %s t ON d.oaid = t.oaid
+			INTO OUTFILE "file:///tmp/"
+			PROPERTIES (
+				"column_separator" = "\t",
+				"line_delimiter" = "\n"
+			)
+		`, tempTableName)
+	case "caid":
+		exportSQL = fmt.Sprintf(`
+			SELECT d.hash_id, d.user_id, d.oaid, d.caid, d.idfa, d.imei
+			FROM dmp_user_mapping_v2 d
+			INNER JOIN %s t ON d.caid = t.caid
+			INTO OUTFILE "file:///tmp/"
+			PROPERTIES (
+				"column_separator" = "\t",
+				"line_delimiter" = "\n"
+			)
+		`, tempTableName)
+	case "idfa":
+		exportSQL = fmt.Sprintf(`
+			SELECT d.hash_id, d.user_id, d.oaid, d.caid, d.idfa, d.imei
+			FROM dmp_user_mapping_v2 d
+			INNER JOIN %s t ON d.idfa = t.idfa
+			INTO OUTFILE "file:///tmp/"
+			PROPERTIES (
+				"column_separator" = "\t",
+				"line_delimiter" = "\n"
+			)
+		`, tempTableName)
+	default:
+		return "", fmt.Errorf("unsupported data type: %s", dataType)
+	}
+
+	log.Printf("Exporting data using SQL: %s", exportSQL)
+
+	// 执行导出操作并获取返回数据
+	rows, err := dorisDB.Query(exportSQL)
+	if err != nil {
+		return "", fmt.Errorf("failed to export data to file: %w", err)
+	}
+	defer rows.Close()
+
+	// Doris返回的列通常为 FileNumber, TotalRows, FileSize, URL
+	var fileURL string
+	if rows.Next() {
+		var fileNumber, totalRows, fileSize sql.NullInt64
+		var url sql.NullString
+		err := rows.Scan(&fileNumber, &totalRows, &fileSize, &url)
+		if err != nil {
+			return "", fmt.Errorf("failed to scan doris export result: %w", err)
+		}
+		if url.Valid {
+			fileURL = url.String
+		} else {
+			return "", fmt.Errorf("doris export did not return file url")
+		}
+	} else {
+		return "", fmt.Errorf("doris export did not return any result row")
+	}
+
+	return fileURL, nil
 }
 
 // dropTempTable 删除临时表

@@ -12,6 +12,7 @@ import (
 type Config struct {
 	MYSQL_DB          string
 	DORIS_DB          string
+	DORIS_IP          string
 	REDIS_DB          string
 	REDIS_POOL_DB     string
 	REDIS_POOL_DB_CRC string
@@ -36,7 +37,8 @@ func LoadConfig(cfg string) *Config {
 
 	config = &Config{
 		MYSQL_DB: getViperStringValue("MYSQL_DB"),
-		//DORIS_DB:          getViperStringValue("DORIS_DB"),
+		DORIS_DB: getViperStringValue("DORIS_DB"),
+		DORIS_IP: getViperStringValue("DORIS_IP"),
 		//REDIS_DB:          getViperStringValue("REDIS_DB"),
 		REDIS_POOL_DB:     getViperStringValue("REDIS_POOL_DB"),
 		REDIS_POOL_DB_CRC: getViperStringValue("REDIS_POOL_DB_CRC"),
