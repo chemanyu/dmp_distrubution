@@ -42,7 +42,7 @@ type DistributionService struct {
 	taskChan       chan *module.Distribution
 	workerSem      chan struct{}
 	wg             sync.WaitGroup
-	isRunning      bool
+	IsRunning      bool
 	progressTicker *time.Ticker
 
 	// 进度追踪
@@ -68,7 +68,7 @@ func NewDistributionService(model *module.Distribution) *DistributionService {
 		cancel:         cancel,
 		taskChan:       make(chan *module.Distribution, 100),
 		workerSem:      make(chan struct{}, MaxParallelWorkers),
-		isRunning:      true,
+		IsRunning:      true,
 		progressTicker: time.NewTicker(ProgressUpdateInterval),
 		lastUpdateTime: make(map[int]time.Time),
 	}
@@ -121,10 +121,10 @@ func (s *DistributionService) taskProcessor() {
 
 // Stop 停止服务
 func (s *DistributionService) Stop() {
-	if !s.isRunning {
+	if !s.IsRunning {
 		return
 	}
-	s.isRunning = false
+	s.IsRunning = false
 
 	if s.cancel != nil {
 		s.cancel()
@@ -141,12 +141,12 @@ func (s *DistributionService) Stop() {
 func (s *DistributionService) StartTaskScheduler() {
 	log.Printf("Starting task scheduler")
 	// 如果需要手动判断服务是否在运行
-	if !s.isRunning {
+	if !s.IsRunning {
 		log.Printf("Task scheduler stopped: service not running")
 		return
 	}
 
-	// 每次查询最多100个待处理任务
+	// 待处理任务
 	tasks, _, err := s.distModel.List(map[string]interface{}{}, 0, 0)
 
 	log.Print("Checking for new tasks to process...", tasks)
@@ -172,7 +172,7 @@ func (s *DistributionService) StartTaskScheduler() {
 
 	// 所有任务提交完成后关闭任务通道
 	// 这会触发 taskProcessor 中的逻辑来等待所有任务完成后停止服务
-	close(s.taskChan)
+	// close(s.taskChan)
 	log.Printf("All tasks submitted, task channel closed")
 }
 
@@ -184,7 +184,7 @@ func (s *DistributionService) progressPersister() {
 			s.flushAllProgress() // 服务停止时，确保刷新所有进度
 			return
 		case <-s.progressTicker.C:
-			if !s.isRunning {
+			if !s.IsRunning {
 				return
 			}
 			s.flushProgress()

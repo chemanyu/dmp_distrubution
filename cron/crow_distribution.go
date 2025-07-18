@@ -31,12 +31,14 @@ func InitCronJobs() {
 // setupDistributionJobs 配置所有与分发相关的定时任务
 func setupDistributionJobs() {
 	// 添加分发任务，每5分钟执行一次
-	//_, err := cronInstance.AddFunc("0 */5 * * * *", func() {
-	_, err := cronInstance.AddFunc("0 0 13 * * *", func() {
+	_, err := cronInstance.AddFunc("0 */5 * * * *", func() {
+		//_, err := cronInstance.AddFunc("0 0 13 * * *", func() {
 		log.Printf("[Cron] Starting distribution job at %v", time.Now().Format("2006-01-02 15:04:05"))
 
 		// 创建分发服务实例
-		distributionSvc = service.NewDistributionService(&module.Distribution{})
+		if distributionSvc == nil || !distributionSvc.IsRunning {
+			distributionSvc = service.NewDistributionService(&module.Distribution{})
+		}
 		// 启动任务调度器（会在后台持续运行）
 		distributionSvc.StartTaskScheduler()
 

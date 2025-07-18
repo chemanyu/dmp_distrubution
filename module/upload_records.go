@@ -33,7 +33,7 @@ func (u *UploadRecords) GetPendingRecords() ([]UploadRecords, error) {
 	var records []UploadRecords
 
 	err := db.Model(&UploadRecords{}).
-		Where("status = ?", "0").
+		Where("status = ? and is_del = ?", "0", "0").
 		Find(&records).Error
 
 	return records, err

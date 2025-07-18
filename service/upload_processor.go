@@ -2,6 +2,7 @@ package service
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -39,55 +40,130 @@ type UploadProcessorService struct {
 	crowdRuleModel *module.CrowdRule
 	mu             sync.Mutex
 	isRunning      bool
+	taskChan       chan *module.UploadRecords
+	wg             sync.WaitGroup
+	ctx            context.Context
+	cancel         context.CancelFunc
 }
 
 // NewUploadProcessorService 创建新的上传处理服务
 func NewUploadProcessorService() *UploadProcessorService {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &UploadProcessorService{
-		uploadModel: &module.UploadRecords{},
-		isRunning:   false,
+		uploadModel:    &module.UploadRecords{},
+		crowdRuleModel: &module.CrowdRule{},
+		isRunning:      false,
+		taskChan:       make(chan *module.UploadRecords, 100), // 任务通道缓冲区
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 }
 
-// StartProcessor 启动处理器
+// StartProcessor 启动处理器 - 使用通道版本
 func (s *UploadProcessorService) StartProcessor() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.isRunning {
 		log.Printf("Upload processor is already running")
+		s.mu.Unlock()
 		return
 	}
 
 	s.isRunning = true
-	log.Printf("Starting upload processor")
+	s.mu.Unlock()
 
-	// 获取待处理的记录
-	records, err := s.uploadModel.GetPendingRecords()
-	if err != nil {
-		log.Printf("Failed to get pending records: %v", err)
-		return
-	}
+	log.Printf("Starting upload processor with channel-based task management")
 
-	if len(records) == 0 {
-		log.Printf("No pending records found")
-		s.isRunning = false
-		return
-	}
+	// 启动任务处理协程
+	go s.taskProcessor()
 
-	// 有序处理每个记录
-	for _, record := range records {
-		if err := s.processRecord(&record); err != nil {
-			log.Printf("Failed to process record %d: %v", record.ID, err)
-			s.uploadModel.UpdateStatus(record.ID, "3")
-		} else {
-			log.Printf("Successfully processed record %d", record.ID)
-			s.uploadModel.UpdateStatus(record.ID, "2")
+	// 启动任务发现协程
+	go s.taskDiscovery()
+}
+
+// taskProcessor 处理任务通道中的任务
+func (s *UploadProcessorService) taskProcessor() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Printf("Task processor stopped: context cancelled")
+			return
+		case task, ok := <-s.taskChan:
+			if !ok {
+				s.wg.Wait() // 等待所有正在执行的任务完成
+				log.Printf("All tasks completed, stopping service")
+				s.Stop()
+				return
+			}
+
+			s.wg.Add(1)
+			go func(record *module.UploadRecords) {
+				defer s.wg.Done()
+
+				if err := s.processRecord(record); err != nil {
+					log.Printf("Failed to process record %d: %v", record.ID, err)
+					s.uploadModel.UpdateStatus(record.ID, "3")
+				} else {
+					log.Printf("Successfully processed record %d", record.ID)
+					s.uploadModel.UpdateStatus(record.ID, "2")
+				}
+			}(task)
 		}
+	}
+}
+
+// taskDiscovery 持续发现新任务并加入任务通道
+func (s *UploadProcessorService) taskDiscovery() {
+	ticker := time.NewTicker(10 * time.Second) // 每10秒检查一次新任务
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Printf("Task taskDiscovery stopped: context cancelled")
+			return
+		case <-ticker.C:
+			// 获取待处理的记录
+			records, err := s.uploadModel.GetPendingRecords()
+			if err != nil {
+				log.Printf("Failed to get pending records: %v", err)
+				continue
+			}
+
+			if len(records) == 0 {
+				continue
+			}
+
+			log.Printf("Found %d pending records, adding to task queue", len(records))
+
+			// 将任务加入通道
+			for _, record := range records {
+				select {
+				case s.taskChan <- &record:
+					log.Printf("Added record %d to task queue", record.ID)
+					s.uploadModel.UpdateStatus(record.ID, "1") // 更新状态为处理中
+				default:
+					log.Printf("Task queue full, skipping record %d", record.ID)
+				}
+			}
+		}
+	}
+}
+
+// Stop 停止处理器
+func (s *UploadProcessorService) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.isRunning {
+		return
+	}
+
+	if s.cancel != nil {
+		s.cancel()
 	}
 
 	s.isRunning = false
-	log.Printf("Upload processor finished")
+	log.Printf("Upload processor stop signal sent")
 }
 
 // processRecord 处理单个记录

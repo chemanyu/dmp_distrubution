@@ -5,63 +5,45 @@ import (
 	"time"
 
 	"dmp_distribution/service"
+
+	"github.com/robfig/cron/v3"
 )
 
-// UploadProcessorCron 上传处理定时任务
-type UploadProcessorCron struct {
-	processor *service.UploadProcessorService
-	ticker    *time.Ticker
-	stopChan  chan struct{}
+var (
+	uploadProcessorSvc *service.UploadProcessorService
+)
+
+// InitUploadCronJobs 初始化上传相关定时任务
+func InitUploadCronJobs() {
+	log.Printf("[Cron] Initializing upload cron jobs...")
+	once.Do(func() {
+		cronInstance = cron.New(cron.WithSeconds())
+		setupUploadJobs()
+		cronInstance.Start()
+		log.Printf("[Cron] Upload cron jobs initialized and started")
+	})
 }
 
-// NewUploadProcessorCron 创建新的上传处理定时任务
-func NewUploadProcessorCron() *UploadProcessorCron {
-	return &UploadProcessorCron{
-		processor: service.NewUploadProcessorService(),
-		stopChan:  make(chan struct{}),
+func setupUploadJobs() {
+	// 初始化上传处理服务（只创建一次）
+	if uploadProcessorSvc == nil {
+		uploadProcessorSvc = service.NewUploadProcessorService()
 	}
-}
 
-// Start 启动定时任务
-func (c *UploadProcessorCron) Start() {
-	// 每分钟检查一次待处理的记录
-	c.ticker = time.NewTicker(1 * time.Minute)
+	// 添加上传任务，每5分钟检查一次服务状态（因为现在处理器会持续运行）
+	_, err := cronInstance.AddFunc("0 */5 * * * *", func() {
+		log.Printf("[Cron] Checking upload processor status at %v", time.Now().Format("2006-01-02 15:04:05"))
 
-	log.Printf("Upload processor cron started, checking every minute")
-
-	// 立即执行一次
-	go c.runProcessor()
-
-	// 定时执行
-	go func() {
-		for {
-			select {
-			case <-c.ticker.C:
-				c.runProcessor()
-			case <-c.stopChan:
-				log.Printf("Upload processor cron stopped")
-				return
-			}
+		// 检查是否已经在运行，如果没有则启动
+		if !uploadProcessorSvc.IsRunning() {
+			log.Printf("[Cron] Upload processor not running, starting...")
+			uploadProcessorSvc.StartProcessor()
+		} else {
+			log.Printf("[Cron] Upload processor is running normally")
 		}
-	}()
-}
+	})
 
-// Stop 停止定时任务
-func (c *UploadProcessorCron) Stop() {
-	if c.ticker != nil {
-		c.ticker.Stop()
+	if err != nil {
+		log.Printf("[Cron] Failed to setup upload job: %v", err)
 	}
-	close(c.stopChan)
-}
-
-// runProcessor 运行处理器
-func (c *UploadProcessorCron) runProcessor() {
-	// 如果处理器已经在运行，则跳过
-	if c.processor.IsRunning() {
-		log.Printf("Upload processor is already running, skipping this cycle")
-		return
-	}
-
-	log.Printf("Starting upload processor cycle")
-	c.processor.StartProcessor()
 }
