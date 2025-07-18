@@ -35,9 +35,10 @@ type UploadFileData struct {
 
 // UploadProcessorService 上传处理服务
 type UploadProcessorService struct {
-	uploadModel *module.UploadRecords
-	mu          sync.Mutex
-	isRunning   bool
+	uploadModel    *module.UploadRecords
+	crowdRuleModel *module.CrowdRule
+	mu             sync.Mutex
+	isRunning      bool
 }
 
 // NewUploadProcessorService 创建新的上传处理服务
@@ -78,10 +79,10 @@ func (s *UploadProcessorService) StartProcessor() {
 	for _, record := range records {
 		if err := s.processRecord(&record); err != nil {
 			log.Printf("Failed to process record %d: %v", record.ID, err)
-			s.uploadModel.UpdateStatus(record.ID, "failed")
+			s.uploadModel.UpdateStatus(record.ID, "3")
 		} else {
 			log.Printf("Successfully processed record %d", record.ID)
-			s.uploadModel.UpdateStatus(record.ID, "completed")
+			s.uploadModel.UpdateStatus(record.ID, "2")
 		}
 	}
 
@@ -94,7 +95,7 @@ func (s *UploadProcessorService) processRecord(record *module.UploadRecords) err
 	log.Printf("Processing record %d: %s", record.ID, record.FileName)
 
 	// 更新状态为处理中
-	if err := s.uploadModel.UpdateStatus(record.ID, "processing"); err != nil {
+	if err := s.uploadModel.UpdateStatus(record.ID, "1"); err != nil {
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
@@ -167,6 +168,12 @@ func (s *UploadProcessorService) processFilesByType(record *module.UploadRecords
 			return nil, fmt.Errorf("failed to create temp table: %w", err)
 		}
 
+		// 创建 crowd_rule 表数据
+		crowdRuleId, err := s.crowdRuleModel.CreateCrowdRuleTable(dataType)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create crowd_rule table: %w", err)
+		}
+
 		// 导入文件数据到临时表
 		if err := s.importFileToTempTable(file.FilePath, tempTableName, dataType); err != nil {
 			s.dropTempTable(tempTableName)
@@ -174,7 +181,7 @@ func (s *UploadProcessorService) processFilesByType(record *module.UploadRecords
 		}
 
 		// 与 doris 进行匹配并生成结果文件
-		resultPath, err := s.matchDataAndGenerateFile(record, tempTableName, dataType)
+		resultPath, err := s.matchDataAndGenerateFile(crowdRuleId, tempTableName, dataType)
 		if err != nil {
 			s.dropTempTable(tempTableName)
 			return nil, fmt.Errorf("failed to match data and generate file: %w", err)
@@ -345,9 +352,9 @@ func (s *UploadProcessorService) importFileToTempTable(filePath, tableName, data
 }
 
 // matchDataAndGenerateFile 匹配数据并生成文件 - 使用 Doris INTO OUTFILE 直接导出
-func (s *UploadProcessorService) matchDataAndGenerateFile(record *module.UploadRecords, tempTableName, dataType string) (string, error) {
+func (s *UploadProcessorService) matchDataAndGenerateFile(crowdRuleId int, tempTableName, dataType string) (string, error) {
 	// 创建结果文件目录
-	resultDir := filepath.Join("results", fmt.Sprintf("%d", record.ID))
+	resultDir := filepath.Join("results", fmt.Sprintf("%d", crowdRuleId))
 	if err := os.MkdirAll(resultDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create result directory: %w", err)
 	}
@@ -388,7 +395,7 @@ func (s *UploadProcessorService) matchDataAndGenerateFile(record *module.UploadR
 		SELECT %d, '%s', bitmap_union(to_bitmap(d.hash_id))
 		FROM dmp_user_mapping_v2 d
 		INNER JOIN %s t ON d.%s = t.%s
-	`, record.ID, eventDate, tempTableName, joinField, joinField)
+	`, crowdRuleId, eventDate, tempTableName, joinField, joinField)
 	log.Printf("Inserting bitmap_union directly: %s", insertSQL)
 	if _, err := dorisDB.Exec(insertSQL); err != nil {
 		return "", fmt.Errorf("failed to insert bitmap_union: %w", err)

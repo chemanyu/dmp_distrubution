@@ -2,26 +2,32 @@ package module
 
 import (
 	mysqldb "dmp_distribution/common/mysql"
+	"fmt"
 	"time"
 )
 
 // CrowdRule 人群规则表
 type CrowdRule struct {
-	ID          int       `gorm:"column:id;primaryKey;autoIncrement" json:"id"`
-	Name        string    `gorm:"column:name;size:64;not null;default:''" json:"name"`                  // 规则名称
-	CategoryID  int       `gorm:"column:category_id;not null;default:0" json:"category_id"`             // 分类id
-	Desc        string    `gorm:"column:desc;size:255;not null;default:''" json:"desc"`                 // 规则描述
-	ExecID      int8      `gorm:"column:exec_id;not null;default:0" json:"exec_id"`                     // 执行类型 1-实时执行 2-每日执行 3-每周执行
-	CreateID    int       `gorm:"column:create_id;not null;default:0" json:"create_id"`                 // 创建人id
-	CreateName  string    `gorm:"column:create_name;size:32;not null;default:''" json:"create_name"`    // 创建人名称
-	FilePath    string    `gorm:"column:file_path;size:255;not null;default:''" json:"file_path"`       // 标签规则结果文件路径
-	LabelJSON   string    `gorm:"column:label_json;type:text" json:"label_json"`                        // 标签json
-	ExecStatus  int8      `gorm:"column:exec_status;not null;default:0" json:"exec_status"`             // 状态 0-待执行 1-执行中 2-执行成功 3-执行失败
-	ExecTime    int       `gorm:"column:exec_time;not null;default:0" json:"exec_time"`                 // 执行时间
-	FailMessage string    `gorm:"column:fail_message;size:255;not null;default:''" json:"fail_message"` // 执行失败原因
-	Status      int8      `gorm:"column:status;not null;default:1" json:"status"`                       // 规则状态 1-有效 2-无效
-	CreateTime  time.Time `gorm:"column:create_time;type:timestamp;default:CURRENT_TIMESTAMP" json:"create_time"`
-	UpdateTime  time.Time `gorm:"column:update_time;type:timestamp;default:CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" json:"update_time"`
+	ID                    int       `gorm:"column:id;primaryKey;autoIncrement" json:"id"`
+	Name                  string    `gorm:"column:name;size:64;not null;default:''" json:"name"`                                          // 规则名称
+	CategoryID            int       `gorm:"column:category_id;not null;default:0" json:"category_id"`                                     // 分类id
+	Desc                  string    `gorm:"column:desc;size:255;not null;default:''" json:"desc"`                                         // 规则描述
+	ExecID                int8      `gorm:"column:exec_id;not null;default:0" json:"exec_id"`                                             // 执行类型 1-实时执行 2-每日执行 3-每周执行
+	CreateID              int       `gorm:"column:create_id;not null;default:0" json:"create_id"`                                         // 创建人id
+	CreateName            string    `gorm:"column:create_name;size:32;not null;default:''" json:"create_name"`                            // 创建人名称
+	FilePath              string    `gorm:"column:file_path;size:255;not null;default:''" json:"file_path"`                               // 标签规则结果文件路径
+	LabelJSON             string    `gorm:"column:label_json;type:text" json:"label_json"`                                                // 标签json
+	ExecStatus            int8      `gorm:"column:exec_status;not null;default:0" json:"exec_status"`                                     // 状态 0-待执行 1-执行中 2-执行成功 3-执行失败
+	ExecTime              int       `gorm:"column:exec_time;not null;default:0" json:"exec_time"`                                         // 执行时间
+	FailMessage           string    `gorm:"column:fail_message;size:255;not null;default:''" json:"fail_message"`                         // 执行失败原因
+	Status                int8      `gorm:"column:status;not null;default:1" json:"status"`                                               // 规则状态 1-有效 2-无效
+	InvolveMember         int       `gorm:"column:involve_member;not null;default:0" json:"involve_member"`                               // 涉及人数
+	OperationType         int8      `gorm:"column:operation_type;not null;default:0" json:"operation_type"`                               // 组合人群操作类型 1-并集 2-交集 3-A与B的补集 4-B与A的补集 5-其它
+	OperationCrowdRuleIDs string    `gorm:"column:operation_crowd_rule_ids;size:255;not null;default:''" json:"operation_crowd_rule_ids"` // 操作人群包ids
+	CustomQuerySQL        string    `gorm:"column:custom_query_sql;size:2048;not null;default:''" json:"custom_query_sql"`                // 自定义查询sql
+	LabelQueryDate        int8      `gorm:"column:label_query_date;not null;default:0" json:"label_query_date"`                           // 标签查询日期
+	CreateTime            time.Time `gorm:"column:create_time;type:timestamp;default:CURRENT_TIMESTAMP" json:"create_time"`
+	UpdateTime            time.Time `gorm:"column:update_time;type:timestamp;default:CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" json:"update_time"`
 }
 
 // TableName 指定表名
@@ -66,4 +72,21 @@ func (c *CrowdRule) GetExecTime(ruleID int) (int, error) {
 		return 0, err
 	}
 	return rule.ExecTime, nil
+}
+
+// createCrowdRuleTable 创建一条 crowd_rule 记录，name=data_type+日期，operation_type=5
+func (c *CrowdRule) CreateCrowdRuleTable(dataType string) (int, error) {
+	db := mysqldb.GetConnected()
+	today := time.Now().Format("20060102")
+	name := fmt.Sprintf("%s_%s", dataType, today)
+	rule := CrowdRule{
+		Name:          name,
+		OperationType: 5,
+		CreateTime:    time.Now(),
+		UpdateTime:    time.Now(),
+	}
+	if err := db.Model(&CrowdRule{}).Create(&rule).Error; err != nil {
+		return 0, err
+	}
+	return rule.ID, nil
 }
