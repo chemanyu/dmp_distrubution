@@ -44,6 +44,7 @@ type UploadProcessorService struct {
 	wg             sync.WaitGroup
 	ctx            context.Context
 	cancel         context.CancelFunc
+	workerSem      chan struct{}
 }
 
 // NewUploadProcessorService 创建新的上传处理服务
@@ -56,6 +57,7 @@ func NewUploadProcessorService() *UploadProcessorService {
 		taskChan:       make(chan *module.UploadRecords, 100), // 任务通道缓冲区
 		ctx:            ctx,
 		cancel:         cancel,
+		workerSem:      make(chan struct{}, MaxParallelWorkers),
 	}
 }
 
@@ -95,9 +97,13 @@ func (s *UploadProcessorService) taskProcessor() {
 				return
 			}
 
+			// 获取工作协程信号量
+			s.workerSem <- struct{}{}
+
 			s.wg.Add(1)
 			go func(record *module.UploadRecords) {
 				defer s.wg.Done()
+				defer func() { <-s.workerSem }() // 释放工作协程信号量
 
 				if err := s.processRecord(record); err != nil {
 					log.Printf("Failed to process record %d: %v", record.ID, err)
