@@ -2,7 +2,6 @@ package module
 
 import (
 	mysqldb "dmp_distribution/common/mysql"
-	"fmt"
 	"time"
 )
 
@@ -75,18 +74,27 @@ func (c *CrowdRule) GetExecTime(ruleID int) (int, error) {
 }
 
 // createCrowdRuleTable 创建一条 crowd_rule 记录，name=data_type+日期，operation_type=5
-func (c *CrowdRule) CreateCrowdRuleTable(dataType string) (int, error) {
+func (c *CrowdRule) CreateCrowdRuleTable(name string) (int, error) {
 	db := mysqldb.GetConnected()
-	today := time.Now().Format("20060102")
-	name := fmt.Sprintf("%s_%s", dataType, today)
 	rule := CrowdRule{
-		Name:          name,
-		OperationType: 5,
-		CreateTime:    time.Now(),
-		UpdateTime:    time.Now(),
+		Name:       name,
+		CategoryID: 4,
+		ExecStatus: 1, // 执行中
 	}
 	if err := db.Model(&CrowdRule{}).Create(&rule).Error; err != nil {
 		return 0, err
 	}
 	return rule.ID, nil
+}
+
+// UpdateCrowdRule 更新 crowd_rule 表的状态和文件路径
+func (c *CrowdRule) UpdateCrowdRule(ruleID int, status int8, filePath string) error {
+	db := mysqldb.GetConnected()
+	rule := CrowdRule{
+		ID:         ruleID,
+		ExecStatus: status,
+		FilePath:   filePath,
+	}
+
+	return db.Model(&CrowdRule{}).Where("id = ?", ruleID).Updates(rule).Error
 }

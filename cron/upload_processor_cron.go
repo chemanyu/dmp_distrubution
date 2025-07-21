@@ -2,6 +2,7 @@ package cron
 
 import (
 	"log"
+	"sync"
 	"time"
 
 	"dmp_distribution/service"
@@ -10,16 +11,18 @@ import (
 )
 
 var (
+	cronInstanceUpload *cron.Cron
+	onceUpload         sync.Once
 	uploadProcessorSvc *service.UploadProcessorService
 )
 
 // InitUploadCronJobs 初始化上传相关定时任务
 func InitUploadCronJobs() {
 	log.Printf("[Cron] Initializing upload cron jobs...")
-	once.Do(func() {
-		cronInstance = cron.New(cron.WithSeconds())
+	onceUpload.Do(func() {
+		cronInstanceUpload = cron.New(cron.WithSeconds())
 		setupUploadJobs()
-		cronInstance.Start()
+		cronInstanceUpload.Start()
 		log.Printf("[Cron] Upload cron jobs initialized and started")
 	})
 }
@@ -31,7 +34,7 @@ func setupUploadJobs() {
 	}
 
 	// 添加上传任务，每5分钟检查一次服务状态（因为现在处理器会持续运行）
-	_, err := cronInstance.AddFunc("0 */5 * * * *", func() {
+	_, err := cronInstanceUpload.AddFunc("0 */5 * * * *", func() {
 		log.Printf("[Cron] Checking upload processor status at %v", time.Now().Format("2006-01-02 15:04:05"))
 
 		// 检查是否已经在运行，如果没有则启动

@@ -58,6 +58,7 @@ func init() {
 	// 初始化 Redis
 	redis.Mates.InitRedis(config.REDIS_POOL_DB)
 	cron.InitCronJobs()
+	cron.InitUploadCronJobs()
 	// 初始化 Doris 数据库连接
 	mysqldb.InitDoris()
 }
