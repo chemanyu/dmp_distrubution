@@ -551,7 +551,7 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 
 	// 查 hash_id 范围
 	var minHashID, maxHashID int64
-	rangeQuery := `SELECT MIN(hash_id), MAX(hash_id) FROM dmp_user_mapping_v2`
+	rangeQuery := `SELECT MIN(hash_id), MAX(hash_id) FROM dmp_user_mapping_v4`
 	if err := dorisDB.QueryRow(rangeQuery).Scan(&minHashID, &maxHashID); err != nil {
 		return fmt.Errorf("query hash_id range error: %w", err)
 	}
@@ -600,7 +600,7 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 				scanFields = append(scanFields, &imei)
 			}
 
-			query := fmt.Sprintf(`SELECT %s FROM dmp_user_mapping_v2 
+			query := fmt.Sprintf(`SELECT %s FROM dmp_user_mapping_v4
 				WHERE hash_id >= ? AND hash_id < ? AND bitmap_contains(
 					(SELECT user_set FROM dmp_crowd_user_bitmap WHERE crowd_rule_id = ? ORDER BY event_date DESC LIMIT 1),
                 	hash_id

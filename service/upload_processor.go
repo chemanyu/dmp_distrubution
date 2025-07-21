@@ -501,7 +501,7 @@ func (s *UploadProcessorService) matchUnifiedDataAndGenerateFile(crowdRuleId int
 	// 使用 UNION ALL 将所有设备类型的匹配结果合并，使用 INTO OUTFILE 直接导出
 	exportSQL := fmt.Sprintf(`
 		SELECT d.hash_id, d.user_id, d.oaid, d.caid, d.idfa, d.imei
-		FROM dmp_user_mapping_v2 d
+		FROM dmp_user_mapping_v4 d
 		INNER JOIN %s t ON (
 			(t.device_type = 'imei' AND d.imei = t.device_id) OR
 			(t.device_type = 'oaid' AND d.oaid = t.device_id) OR
@@ -547,7 +547,7 @@ func (s *UploadProcessorService) matchUnifiedDataAndGenerateFile(crowdRuleId int
 	insertSQL := fmt.Sprintf(`
 		INSERT INTO dmp_crowd_user_bitmap (crowd_rule_id, event_date, user_set)
 		SELECT %d, '%s', bitmap_union(to_bitmap(d.hash_id))
-		FROM dmp_user_mapping_v2 d
+		FROM dmp_user_mapping_v4 d
 		INNER JOIN %s t ON (
 			(t.device_type = 'imei' AND d.imei = t.device_id) OR
 			(t.device_type = 'oaid' AND d.oaid = t.device_id) OR
