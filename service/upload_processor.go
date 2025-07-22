@@ -192,7 +192,7 @@ func (s *UploadProcessorService) processRecord(record *module.UploadRecords) (er
 	}
 
 	// 创建 crowd_rule 表数据
-	crowdRuleId, err := s.crowdRuleModel.CreateCrowdRuleTable(record.FileName)
+	crowdRuleId, err := s.crowdRuleModel.CreateCrowdRuleTable(record.FileName, record.CreateId)
 	if err != nil {
 		return fmt.Errorf("failed to create crowd_rule table: %w", err), 0
 	}

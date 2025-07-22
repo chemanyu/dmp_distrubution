@@ -16,6 +16,8 @@ type UploadRecords struct {
 	UploadTime      time.Time `gorm:"column:upload_time;not null" json:"upload_time"`
 	Status          string    `gorm:"column:status;not null;size:20" json:"status"`
 	RecordFilePaths string    `gorm:"column:record_file_paths;type:text" json:"record_file_paths"`
+	IsDel           int8      `gorm:"column:is_del;not null;default:0" json:"is_del"`       // 0-未删除，1-已删除
+	CreateId        int       `gorm:"column:create_id;not null;default:0" json:"create_id"` // 创建人ID
 }
 
 // TableName 指定表名
