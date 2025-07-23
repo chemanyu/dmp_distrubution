@@ -105,7 +105,7 @@ func (s *UploadProcessorService) taskProcessor() {
 				defer s.wg.Done()
 				defer func() { <-s.workerSem }() // 释放工作协程信号量
 
-				if err, crowdRuleId := s.processRecord(record); err != nil {
+				if crowdRuleId, err := s.processRecord(record); err != nil {
 					log.Printf("Failed to process record %d: %v", record.ID, err)
 					s.uploadModel.UpdateStatus(record.ID, "3")
 					s.crowdRuleModel.UpdateCrowdRule(crowdRuleId, 3, "")
@@ -174,49 +174,49 @@ func (s *UploadProcessorService) Stop() {
 }
 
 // processRecord 处理单个记录
-func (s *UploadProcessorService) processRecord(record *module.UploadRecords) (error, int) {
+func (s *UploadProcessorService) processRecord(record *module.UploadRecords) (int, error) {
 	log.Printf("Processing record %d: %s", record.ID, record.FileName)
 
 	// 更新状态为处理中
 	if err := s.uploadModel.UpdateStatus(record.ID, "1"); err != nil {
-		return fmt.Errorf("failed to update status: %w", err), 0
+		return 0, fmt.Errorf("failed to update status: %w", err)
 	}
 
 	// 解析上传文件路径
 	var uploadData UploadFileData
 	var unescaped string
 	if err := json.Unmarshal([]byte(record.UploadFilePaths), &unescaped); err != nil {
-		return fmt.Errorf("failed to unescape JSON: %w", err), 0
+		return 0, fmt.Errorf("failed to unescape JSON: %w", err)
 	}
 	if err := json.Unmarshal([]byte(unescaped), &uploadData); err != nil {
-		return fmt.Errorf("failed to parse upload file paths: %w", err), 0
+		return 0, fmt.Errorf("failed to parse upload file paths: %w", err)
 	}
 
 	// 创建 crowd_rule 表数据
 	crowdRuleId, err := s.crowdRuleModel.CreateCrowdRuleTable(record.FileName, record.CreateId)
 	if err != nil {
-		return fmt.Errorf("failed to create crowd_rule table: %w", err), 0
+		return 0, fmt.Errorf("failed to create crowd_rule table: %w", err)
 	}
 
 	// 统一处理所有文件，生成一个人群包文件和一条bitmap记录
 	resultPath, err := s.processAllFiles(record, uploadData, crowdRuleId)
 	if err != nil {
-		return fmt.Errorf("failed to process all files: %w", err), 0
+		return 0, fmt.Errorf("failed to process all files: %w", err)
 	}
 
 	// 更新记录文件路径
 	if resultPath != "" {
 		if err := s.uploadModel.UpdateRecordFilePaths(record.ID, resultPath); err != nil {
-			return fmt.Errorf("failed to update record file paths: %w", err), 0
+			return 0, fmt.Errorf("failed to update record file paths: %w", err)
 		}
 	}
 
 	// 更新crowd_rule 表状态
 	if err := s.crowdRuleModel.UpdateCrowdRule(crowdRuleId, 2, resultPath); err != nil {
-		return fmt.Errorf("failed to update crowd_rule table status: %w", err), 0
+		return 0, fmt.Errorf("failed to update crowd_rule table status: %w", err)
 	}
 
-	return nil, crowdRuleId
+	return crowdRuleId, nil
 }
 
 // processAllFiles 统一处理所有文件，生成一个人群包文件和一条bitmap记录
