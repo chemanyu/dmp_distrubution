@@ -27,10 +27,11 @@ type UploadFile struct {
 
 // UploadFileData 上传文件数据结构
 type UploadFileData struct {
-	ImeiFiles []UploadFile `json:"imei-files"`
-	OaidFiles []UploadFile `json:"oaid-files"`
-	CaidFiles []UploadFile `json:"caid-files"`
-	IdfaFiles []UploadFile `json:"idfa-files"`
+	ImeiFiles   []UploadFile `json:"imei-files"`
+	OaidFiles   []UploadFile `json:"oaid-files"`
+	CaidFiles   []UploadFile `json:"caid-files"`
+	IdfaFiles   []UploadFile `json:"idfa-files"`
+	UserIdFiles []UploadFile `json:"user_id-files"`
 }
 
 // UploadProcessorService 上传处理服务
@@ -271,6 +272,17 @@ func (s *UploadProcessorService) processAllFiles(record *module.UploadRecords, u
 			log.Printf("Processing IDFA file: %s", file.FileName)
 			if err := s.importFileToUnifiedTable(file.FilePath, tempTableName, "idfa"); err != nil {
 				return "", fmt.Errorf("failed to import IDFA file %s: %w", file.FileName, err)
+			}
+			totalFiles++
+		}
+	}
+
+	// 处理 UserID 文件
+	if len(uploadData.UserIdFiles) > 0 {
+		for _, file := range uploadData.UserIdFiles {
+			log.Printf("Processing UserID file: %s", file.FileName)
+			if err := s.importFileToUnifiedTable(file.FilePath, tempTableName, "user_id"); err != nil {
+				return "", fmt.Errorf("failed to import UserID file %s: %w", file.FileName, err)
 			}
 			totalFiles++
 		}
