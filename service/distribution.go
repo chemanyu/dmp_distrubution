@@ -804,20 +804,19 @@ func (s *DistributionService) updateProgress(taskID int, delta int64) {
 // saveBatchToFile 将batch数据按selectFields顺序保存到文件
 func (s *DistributionService) saveBatchToFile(task *module.Distribution, batch []map[string]string, selectFields []string) error {
 	// 获取保存地址
-	baseAddress := core.GetConfig().SERVER_ADDRESS
+	baseAddress := core.GetConfig().OUTPUT_DIR
 	if baseAddress == "" {
 		baseAddress = "./output" // 默认输出目录
 	}
 
 	// 创建输出目录
-	outputDir := filepath.Join(baseAddress, "distribution_output")
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
+	if err := os.MkdirAll(baseAddress, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
 	// 生成文件名，只包含任务ID，不包含时间戳，确保同一任务写入同一文件
 	fileName := fmt.Sprintf("task_%d.txt", task.ID)
-	filePath := filepath.Join(outputDir, fileName)
+	filePath := filepath.Join(baseAddress, fileName)
 
 	// 打开文件进行追加写入
 	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
