@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	mysqldb "dmp_distribution/common/mysql"
+	"dmp_distribution/core"
 	"dmp_distribution/module"
 	"dmp_distribution/platform"
 )
@@ -651,6 +654,11 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 					batch = append(batch, item)
 				}
 				if len(batch) >= StreamBatchSize {
+					// 保存batch数据到文件
+					if err := s.saveBatchToFile(task, batch, selectFields); err != nil {
+						log.Printf("Failed to save batch to file: %v", err)
+					}
+
 					if err := s.processBatch(task, batch); err != nil {
 						mu.Lock()
 						if firstErr == nil {
@@ -666,6 +674,11 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 				}
 			}
 			if len(batch) > 0 {
+				// 保存batch数据到文件
+				if err := s.saveBatchToFile(task, batch, selectFields); err != nil {
+					log.Printf("Failed to save batch to file: %v", err)
+				}
+
 				if err := s.processBatch(task, batch); err != nil {
 					mu.Lock()
 					if firstErr == nil {
@@ -786,4 +799,73 @@ func (s *DistributionService) updateProgress(taskID int, delta int64) {
 
 	// 原子递增计数
 	atomic.AddInt64(&progress.currentCount, delta)
+}
+
+// saveBatchToFile 将batch数据按selectFields顺序保存到文件
+func (s *DistributionService) saveBatchToFile(task *module.Distribution, batch []map[string]string, selectFields []string) error {
+	// 获取保存地址
+	baseAddress := core.GetConfig().SERVER_ADDRESS
+	if baseAddress == "" {
+		baseAddress = "./output" // 默认输出目录
+	}
+
+	// 创建输出目录
+	outputDir := filepath.Join(baseAddress, "distribution_output")
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	// 生成文件名，只包含任务ID，不包含时间戳，确保同一任务写入同一文件
+	fileName := fmt.Sprintf("task_%d.txt", task.ID)
+	filePath := filepath.Join(outputDir, fileName)
+
+	// 打开文件进行追加写入
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open file for writing: %w", err)
+	}
+	defer file.Close()
+
+	// 将batch数据写入文件，按照selectFields的顺序
+	for _, item := range batch {
+		var values []string
+
+		// 按照selectFields的顺序输出字段
+		for _, field := range selectFields {
+			if field == "caid" {
+				// 处理多个caid字段的特殊情况
+				var caids []string
+				for i := 1; ; i++ {
+					if caid, exists := item[fmt.Sprintf("caid_%d", i)]; exists {
+						caids = append(caids, caid)
+					} else {
+						break
+					}
+				}
+				if len(caids) > 0 {
+					values = append(values, strings.Join(caids, ","))
+				} else {
+					values = append(values, "") // 空值占位
+				}
+			} else {
+				// 普通字段处理
+				if val, exists := item[field]; exists {
+					values = append(values, val)
+				} else {
+					values = append(values, "") // 空值占位
+				}
+			}
+		}
+
+		// 如果有数据，写入文件
+		if len(values) > 0 {
+			line := strings.Join(values, "\t") + "\n"
+			if _, err := file.WriteString(line); err != nil {
+				return fmt.Errorf("failed to write to file: %w", err)
+			}
+		}
+	}
+
+	log.Printf("Saved %d records to file: %s", len(batch), filePath)
+	return nil
 }

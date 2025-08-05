@@ -13,7 +13,6 @@ import (
 	"time"
 
 	mysqldb "dmp_distribution/common/mysql"
-	"dmp_distribution/core"
 	"dmp_distribution/module"
 )
 
@@ -504,7 +503,7 @@ func (s *UploadProcessorService) matchUnifiedDataAndGenerateFile(crowdRuleId int
 		return "", fmt.Errorf("doris connection is not initialized")
 	}
 
-	// 获取Doris IP
+	/* // 获取Doris IP - 生成数据文件的逻辑，暂时取消
 	dorisIP := core.GetConfig().DORIS_IP
 	if dorisIP == "" {
 		return "", fmt.Errorf("failed to parse doris ip from IP: %s", dorisIP)
@@ -552,7 +551,7 @@ func (s *UploadProcessorService) matchUnifiedDataAndGenerateFile(crowdRuleId int
 		}
 	} else {
 		return "", fmt.Errorf("doris export did not return any result row")
-	}
+	} */
 
 	// 统一聚合插入 bitmap - 将所有设备类型的匹配结果合并到一个bitmap中
 	eventDate := time.Now().Format("2006-01-02 15:04:05")
@@ -573,6 +572,6 @@ func (s *UploadProcessorService) matchUnifiedDataAndGenerateFile(crowdRuleId int
 		return "", fmt.Errorf("failed to insert unified bitmap: %w", err)
 	}
 
-	log.Printf("Successfully created unified crowd bitmap for crowd_rule_id %d with file URL: %s", crowdRuleId, fileURL)
-	return fileURL, nil
+	log.Printf("Successfully created unified crowd bitmap for crowd_rule_id %d with file URL: %s", crowdRuleId, "")
+	return "", nil
 }
