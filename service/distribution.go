@@ -52,6 +52,9 @@ type DistributionService struct {
 	progressMap sync.Map // 用于存储每个任务的进度
 	//progressMutex  sync.RWMutex      // 用于保护进度更新
 	lastUpdateTime map[int]time.Time // 记录每个任务最后更新时间
+
+	// 文件路径追踪
+	taskFilePaths sync.Map // 用于存储每个任务生成的文件路径 map[int]string
 }
 
 // taskProgress 任务进度结构
@@ -655,8 +658,11 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 				}
 				if len(batch) >= StreamBatchSize {
 					// 保存batch数据到文件
-					if err := s.saveBatchToFile(task, batch, selectFields); err != nil {
+					if filePath, err := s.saveBatchToFile(task, batch, selectFields); err != nil {
 						log.Printf("Failed to save batch to file: %v", err)
+					} else {
+						// 记录文件路径
+						s.taskFilePaths.Store(task.ID, filePath)
 					}
 
 					if err := s.processBatch(task, batch); err != nil {
@@ -675,8 +681,11 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 			}
 			if len(batch) > 0 {
 				// 保存batch数据到文件
-				if err := s.saveBatchToFile(task, batch, selectFields); err != nil {
+				if filePath, err := s.saveBatchToFile(task, batch, selectFields); err != nil {
 					log.Printf("Failed to save batch to file: %v", err)
+				} else {
+					// 记录文件路径
+					s.taskFilePaths.Store(task.ID, filePath)
 				}
 
 				if err := s.processBatch(task, batch); err != nil {
@@ -743,6 +752,19 @@ func (s *DistributionService) processBatch(task *module.Distribution, batch []ma
 func (s *DistributionService) finalizeTask(task *module.Distribution, status int, err error) error {
 	if status == TaskFailStatus {
 		log.Printf("Task %d failed: %v", task.ID, err)
+	} else if status == TaskDoneStatus {
+		// 任务成功完成时，保存文件路径到数据库
+		if filePath, exists := s.taskFilePaths.Load(task.ID); exists {
+			if path, ok := filePath.(string); ok {
+				if updateErr := s.distModel.UpdatePath(task.ID, path); updateErr != nil {
+					log.Printf("Failed to update file path for task %d: %v", task.ID, updateErr)
+				} else {
+					log.Printf("Successfully updated file path for task %d: %s", task.ID, path)
+				}
+				// 清理内存中的文件路径记录
+				s.taskFilePaths.Delete(task.ID)
+			}
+		}
 	}
 	return s.distModel.UpdateStatus(task.ID, status)
 }
@@ -801,8 +823,8 @@ func (s *DistributionService) updateProgress(taskID int, delta int64) {
 	atomic.AddInt64(&progress.currentCount, delta)
 }
 
-// saveBatchToFile 将batch数据按selectFields顺序保存到文件
-func (s *DistributionService) saveBatchToFile(task *module.Distribution, batch []map[string]string, selectFields []string) error {
+// saveBatchToFile 将batch数据按selectFields顺序保存到文件，返回文件路径
+func (s *DistributionService) saveBatchToFile(task *module.Distribution, batch []map[string]string, selectFields []string) (string, error) {
 	// 获取保存地址
 	baseAddress := core.GetConfig().OUTPUT_DIR
 	if baseAddress == "" {
@@ -811,17 +833,17 @@ func (s *DistributionService) saveBatchToFile(task *module.Distribution, batch [
 
 	// 创建输出目录
 	if err := os.MkdirAll(baseAddress, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
+		return "", fmt.Errorf("failed to create output directory: %w", err)
 	}
 
 	// 生成文件名，只包含任务ID，不包含时间戳，确保同一任务写入同一文件
-	fileName := fmt.Sprintf("task_%d.txt", task.ID)
+	fileName := fmt.Sprintf("task_%d.csv", task.ID)
 	filePath := filepath.Join(baseAddress, fileName)
 
 	// 打开文件进行追加写入
 	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open file for writing: %w", err)
+		return "", fmt.Errorf("failed to open file for writing: %w", err)
 	}
 	defer file.Close()
 
@@ -860,11 +882,11 @@ func (s *DistributionService) saveBatchToFile(task *module.Distribution, batch [
 		if len(values) > 0 {
 			line := strings.Join(values, "\t") + "\n"
 			if _, err := file.WriteString(line); err != nil {
-				return fmt.Errorf("failed to write to file: %w", err)
+				return "", fmt.Errorf("failed to write to file: %w", err)
 			}
 		}
 	}
 
 	log.Printf("Saved %d records to file: %s", len(batch), filePath)
-	return nil
+	return filePath, nil
 }

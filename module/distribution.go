@@ -96,3 +96,35 @@ func (d *Distribution) UpdateExecTime(id int, execTime int64) error {
 		Where("id = ?", id).
 		Update("exec_time", execTime).Error
 }
+
+// UpdatePath 更新任务的输出文件路径
+// filePath 为生成的文件的完整路径
+func (d *Distribution) UpdatePath(id int, filePath string) error {
+	db := mysqldb.GetConnected()
+	return db.Model(&Distribution{}).
+		Where("id = ?", id).
+		Update("path", filePath).Error
+}
+
+// GetByID 通过ID获取单个分发任务记录
+// id 为任务的主键ID
+// 返回值：任务记录、是否找到、错误信息
+func (d *Distribution) GetByID(id int) (*Distribution, bool, error) {
+	db := mysqldb.GetConnected()
+	var record Distribution
+
+	err := db.Model(&Distribution{}).
+		Where("id = ? AND is_del = ?", id, 0). // 只查询未删除的记录
+		First(&record).Error
+
+	if err != nil {
+		// 如果是记录不存在的错误，返回未找到
+		if err.Error() == "record not found" {
+			return nil, false, nil
+		}
+		// 其他数据库错误
+		return nil, false, err
+	}
+
+	return &record, true, nil
+}
