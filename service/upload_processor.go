@@ -563,7 +563,8 @@ func (s *UploadProcessorService) matchUnifiedDataAndGenerateFile(crowdRuleId int
 			(t.device_type = 'imei' AND d.imei = t.device_id) OR
 			(t.device_type = 'oaid' AND d.oaid = t.device_id) OR
 			(t.device_type = 'caid' AND d.caid = t.device_id) OR
-			(t.device_type = 'idfa' AND d.idfa = t.device_id)
+			(t.device_type = 'idfa' AND d.idfa = t.device_id) OR
+			(t.device_type = 'user_id' AND d.user_id = t.device_id)
 		)
 	`, crowdRuleId, eventDate, tempTableName)
 
