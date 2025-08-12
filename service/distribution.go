@@ -72,7 +72,7 @@ func NewDistributionService(model *module.Distribution) *DistributionService {
 		crowdRule:      &module.CrowdRule{},
 		ctx:            ctx,
 		cancel:         cancel,
-		taskChan:       make(chan *module.Distribution, 100),
+		taskChan:       make(chan *module.Distribution),
 		workerSem:      make(chan struct{}, MaxParallelWorkers),
 		IsRunning:      true,
 		progressTicker: time.NewTicker(ProgressUpdateInterval),
@@ -95,13 +95,7 @@ func (s *DistributionService) taskProcessor() {
 			log.Printf("Task processor stopped: context cancelled")
 			return
 		case task, ok := <-s.taskChan:
-			if !ok {
-				s.wg.Wait() // 等待所有正在执行的任务完成
-				log.Printf("All tasks completed, stopping service")
-				s.Stop()
-				return
-			}
-
+			log.Printf("Received task %d for processing, ok: %v", task.ID, ok)
 			// 获取工作协程信号量
 			s.workerSem <- struct{}{}
 
@@ -121,6 +115,10 @@ func (s *DistributionService) taskProcessor() {
 					s.distModel.UpdateExecTime(t.ID, time.Now().Unix())
 				}
 			}(task)
+		case <-time.After(30 * time.Second): // 30秒超时，可根据需要调整
+			log.Printf("No tasks received for 30 seconds, stopping service")
+			s.Stop()
+			return
 		}
 	}
 }
@@ -542,7 +540,7 @@ func (s *DistributionService) initTaskStatus(task *module.Distribution) error {
 		return fmt.Errorf("update status error: %w", err)
 	}
 	// 初始化行数为0
-	if err := s.distModel.UpdateLineCount(task.ID, 0); err != nil {
+	if err := s.distModel.UpdateLineCountZero(task.ID, 0); err != nil {
 		return fmt.Errorf("init line count error: %w", err)
 	}
 	return nil
@@ -550,6 +548,20 @@ func (s *DistributionService) initTaskStatus(task *module.Distribution) error {
 
 // processByStrategyID 通过StrategyID从Doris获取最新user_set，查mapping表，整理为batch推送redis，并兼容进度/状态
 func (s *DistributionService) processByStrategyID(task *module.Distribution, strategyID int64) error {
+	// 获取保存地址
+	baseAddress := core.GetConfig().OUTPUT_DIR
+	if baseAddress == "" {
+		baseAddress = "./output" // 默认输出目录
+	}
+	// 创建输出目录
+	if err := os.MkdirAll(baseAddress, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+	// 生成文件名，只包含任务ID，不包含时间戳，确保同一任务写入同一文件
+	fileName := fmt.Sprintf("task_%d_%s.csv", task.ID, time.Now().Format("200601021504"))
+	filePath := filepath.Join(baseAddress, fileName)
+	s.taskFilePaths.Store(task.ID, filePath)
+
 	dorisDB := mysqldb.Doris
 	if dorisDB == nil {
 		return fmt.Errorf("doris connection is not initialized")
@@ -627,6 +639,7 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 			batch := make([]map[string]string, 0, StreamBatchSize)
 			processed := 0
 			for rows.Next() {
+				log.Printf("Reading row... userID: %s, oaid: %s, caid: %s, idfa: %s, imei: %s", userID, oaid, caid, idfa, imei)
 				if err := rows.Scan(scanFields...); err != nil {
 					log.Printf("Scan error: %v", err)
 					continue
@@ -658,11 +671,8 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 				}
 				if len(batch) >= StreamBatchSize {
 					// 保存batch数据到文件
-					if filePath, err := s.saveBatchToFile(task, batch, selectFields); err != nil {
+					if err := s.saveBatchToFile(task, batch, selectFields, filePath); err != nil {
 						log.Printf("Failed to save batch to file: %v", err)
-					} else {
-						// 记录文件路径
-						s.taskFilePaths.Store(task.ID, filePath)
 					}
 
 					if err := s.processBatch(task, batch); err != nil {
@@ -681,11 +691,8 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 			}
 			if len(batch) > 0 {
 				// 保存batch数据到文件
-				if filePath, err := s.saveBatchToFile(task, batch, selectFields); err != nil {
+				if err := s.saveBatchToFile(task, batch, selectFields, filePath); err != nil {
 					log.Printf("Failed to save batch to file: %v", err)
-				} else {
-					// 记录文件路径
-					s.taskFilePaths.Store(task.ID, filePath)
 				}
 
 				if err := s.processBatch(task, batch); err != nil {
@@ -706,7 +713,7 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 	wg.Wait()
 
 	// 分区全部完成后，刷新进度
-	s.flushProgress()
+	// s.flushProgress()
 
 	if firstErr != nil {
 		s.finalizeTask(task, TaskFailStatus, firstErr)
@@ -781,9 +788,9 @@ func (s *DistributionService) flushProgress() {
 		currentCount := atomic.LoadInt64(&progress.currentCount)
 		lastDBCount := atomic.LoadInt64(&progress.lastDBCount)
 
+		log.Printf("Flushing progress for task %d: currentCount=%d, lastDBCount=%d, lastUpdate=%v", taskID, currentCount, lastDBCount, progress.lastUpdate)
 		// 只有当处理行数显著增加或距离上次更新时间较长时才更新
-		if currentCount-lastDBCount >= MinProgressDiff ||
-			now.Sub(progress.lastUpdate) >= ProgressUpdateInterval {
+		if currentCount-lastDBCount >= MinProgressDiff || now.Sub(progress.lastUpdate) >= ProgressUpdateInterval {
 			if err := s.distModel.UpdateLineCount(taskID, currentCount); err != nil {
 				log.Printf("Failed to update line count for task %d: %v", taskID, err)
 			} else {
@@ -820,30 +827,16 @@ func (s *DistributionService) updateProgress(taskID int, delta int64) {
 	progress := value.(*taskProgress)
 
 	// 原子递增计数
-	atomic.AddInt64(&progress.currentCount, delta)
+	atomic.StoreInt64(&progress.currentCount, delta)
 }
 
 // saveBatchToFile 将batch数据按selectFields顺序保存到文件，返回文件路径
-func (s *DistributionService) saveBatchToFile(task *module.Distribution, batch []map[string]string, selectFields []string) (string, error) {
-	// 获取保存地址
-	baseAddress := core.GetConfig().OUTPUT_DIR
-	if baseAddress == "" {
-		baseAddress = "./output" // 默认输出目录
-	}
-
-	// 创建输出目录
-	if err := os.MkdirAll(baseAddress, 0755); err != nil {
-		return "", fmt.Errorf("failed to create output directory: %w", err)
-	}
-
-	// 生成文件名，只包含任务ID，不包含时间戳，确保同一任务写入同一文件
-	fileName := fmt.Sprintf("task_%d.csv", task.ID)
-	filePath := filepath.Join(baseAddress, fileName)
+func (s *DistributionService) saveBatchToFile(task *module.Distribution, batch []map[string]string, selectFields []string, filePath string) error {
 
 	// 打开文件进行追加写入
 	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		return "", fmt.Errorf("failed to open file for writing: %w", err)
+		return fmt.Errorf("failed to open file for writing: %w", err)
 	}
 	defer file.Close()
 
@@ -882,11 +875,11 @@ func (s *DistributionService) saveBatchToFile(task *module.Distribution, batch [
 		if len(values) > 0 {
 			line := strings.Join(values, "\t") + "\n"
 			if _, err := file.WriteString(line); err != nil {
-				return "", fmt.Errorf("failed to write to file: %w", err)
+				return fmt.Errorf("failed to write to file: %w", err)
 			}
 		}
 	}
 
-	log.Printf("Saved %d records to file: %s", len(batch), filePath)
-	return filePath, nil
+	log.Printf("Saved %d records to file", len(batch))
+	return nil
 }

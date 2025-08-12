@@ -77,6 +77,15 @@ func (d *Distribution) UpdateStatus(id int, status int) error {
 	return db.Model(&Distribution{}).Where("id = ?", id).Update("status", status).Error
 }
 
+func (d *Distribution) UpdateLineCountZero(id int, lineCount int64) error {
+	db := mysqldb.GetConnected()
+	result := db.Model(&Distribution{}).
+		Where("id = ?", id).
+		Update("line_count", lineCount)
+
+	return result.Error
+}
+
 // UpdateLineCount 原子更新行数计数
 // 只有当新的计数大于现有计数时才更新，避免并发问题
 func (d *Distribution) UpdateLineCount(id int, lineCount int64) error {
