@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -22,7 +23,7 @@ const (
 	// TaskStatusKey      = "dmp:distribution:task:status:%d"
 	// TaskProgressKey    = "dmp:distribution:task:progress:%d"
 	RetryMaxTimes      = 3
-	StreamBatchSize    = 1000
+	StreamBatchSize    = 100000
 	MaxParallelWorkers = 10
 	RedisBatchSize     = 500
 	TaskNoStartStatus  = 0 // 任务未开始状态
@@ -38,15 +39,15 @@ const (
 
 // DistributionService 分发服务
 type DistributionService struct {
-	distModel      *module.Distribution
-	crowdRule      *module.CrowdRule
-	ctx            context.Context
-	cancel         context.CancelFunc
-	taskChan       chan *module.Distribution
-	workerSem      chan struct{}
-	wg             sync.WaitGroup
-	IsRunning      bool
-	progressTicker *time.Ticker
+	distModel *module.Distribution
+	crowdRule *module.CrowdRule
+	ctx       context.Context
+	cancel    context.CancelFunc
+	taskChan  chan *module.Distribution
+	workerSem chan struct{}
+	wg        sync.WaitGroup
+	IsRunning bool
+	//progressTicker *time.Ticker
 
 	// 进度追踪
 	progressMap sync.Map // 用于存储每个任务的进度
@@ -68,19 +69,18 @@ type taskProgress struct {
 func NewDistributionService(model *module.Distribution) *DistributionService {
 	ctx, cancel := context.WithCancel(context.Background())
 	srv := &DistributionService{
-		distModel:      model,
-		crowdRule:      &module.CrowdRule{},
-		ctx:            ctx,
-		cancel:         cancel,
-		taskChan:       make(chan *module.Distribution),
-		workerSem:      make(chan struct{}, MaxParallelWorkers),
-		IsRunning:      true,
-		progressTicker: time.NewTicker(ProgressUpdateInterval),
+		distModel: model,
+		crowdRule: &module.CrowdRule{},
+		ctx:       ctx,
+		cancel:    cancel,
+		taskChan:  make(chan *module.Distribution),
+		workerSem: make(chan struct{}, MaxParallelWorkers),
+		IsRunning: true,
+		//progressTicker: time.NewTicker(ProgressUpdateInterval),
 		lastUpdateTime: make(map[int]time.Time),
 	}
 
 	// 启动必要的后台任务
-	go srv.progressPersister()
 	go srv.taskProcessor()
 
 	return srv
@@ -93,6 +93,7 @@ func (s *DistributionService) taskProcessor() {
 		select {
 		case <-s.ctx.Done():
 			log.Printf("Task processor stopped: context cancelled")
+			s.flushAllProgress()
 			return
 		case task, ok := <-s.taskChan:
 			log.Printf("Received task %d for processing, ok: %v", task.ID, ok)
@@ -101,6 +102,7 @@ func (s *DistributionService) taskProcessor() {
 
 			s.wg.Add(1)
 			go func(t *module.Distribution) {
+				begin := time.Now()
 				defer s.wg.Done()
 				defer func() { <-s.workerSem }() // 释放工作协程信号量
 
@@ -110,12 +112,32 @@ func (s *DistributionService) taskProcessor() {
 				if err := s.processTask(t); err != nil {
 					log.Printf("Task %d failed after %v: %v", t.ID, time.Since(startTime), err)
 					s.finalizeTask(t, TaskFailStatus, err)
-				} else {
-					log.Printf("Task %d completed successfully after %v", t.ID, time.Since(startTime))
-					s.distModel.UpdateExecTime(t.ID, time.Now().Unix())
+					return
+				}
+				log.Printf("Task %d completed successfully after %v", t.ID, time.Since(startTime))
+				s.distModel.UpdateExecTime(t.ID, time.Now().Unix())
+
+				// 保存数据文件
+				end := time.Now()
+				log.Printf("Task %d processing time: %v", t.ID, end.Sub(begin))
+				if err := s.saveFileByStrategyID(task, int64(task.StrategyID), end.Sub(begin)); err != nil {
+					log.Printf("SaveFile %d failed after %v: %v", t.ID, time.Since(startTime), err)
+				}
+				// 任务成功完成时，保存文件路径到数据库
+				if filePath, exists := s.taskFilePaths.Load(task.ID); exists {
+					if path, ok := filePath.(string); ok {
+						if updateErr := s.distModel.UpdatePath(task.ID, path); updateErr != nil {
+							log.Printf("Failed to update file path for task %d: %v", task.ID, updateErr)
+						} else {
+							log.Printf("Successfully updated file path for task %d: %s", task.ID, path)
+						}
+						// 清理内存中的文件路径记录
+						s.taskFilePaths.Delete(task.ID)
+					}
 				}
 			}(task)
 		case <-time.After(30 * time.Second): // 30秒超时，可根据需要调整
+			s.wg.Wait()
 			log.Printf("No tasks received for 30 seconds, stopping service")
 			s.Stop()
 			return
@@ -132,10 +154,6 @@ func (s *DistributionService) Stop() {
 
 	if s.cancel != nil {
 		s.cancel()
-	}
-
-	if s.progressTicker != nil {
-		s.progressTicker.Stop()
 	}
 
 	log.Printf("Distribution service stopped gracefully")
@@ -181,20 +199,6 @@ func (s *DistributionService) StartTaskScheduler() {
 }
 
 // progressPersister 定期将内存中的进度持久化到数据库
-func (s *DistributionService) progressPersister() {
-	for {
-		select {
-		case <-s.ctx.Done():
-			s.flushAllProgress() // 服务停止时，确保刷新所有进度
-			return
-		case <-s.progressTicker.C:
-			if !s.IsRunning {
-				return
-			}
-			s.flushProgress()
-		}
-	}
-}
 
 // processTask 处理单个任务
 func (s *DistributionService) processTask(task *module.Distribution) error {
@@ -202,16 +206,6 @@ func (s *DistributionService) processTask(task *module.Distribution) error {
 	if err := s.initTaskStatus(task); err != nil {
 		return err
 	}
-
-	// 2. 流式处理文件
-	// processor := func(batch []map[string]string) error {
-	// 	return s.processBatch(task, batch)
-	// }
-
-	// if err := s.streamProcessFile(task, processor); err != nil {
-	// 	s.finalizeTask(task, TaskFailStatus, err)
-	// 	return err
-	// }
 
 	// 处理策略ID分发
 	if err := s.processByStrategyID(task, int64(task.StrategyID)); err != nil {
@@ -222,317 +216,6 @@ func (s *DistributionService) processTask(task *module.Distribution) error {
 	// 3. 最终状态更新
 	return s.finalizeTask(task, TaskDoneStatus, nil)
 }
-
-// findRemoteFiles 在远程服务器上查找匹配的文件
-/*func (s *DistributionService) findRemoteFiles(serverIP, remotePattern string) ([]string, error) {
-	// 使用ssh执行ls命令来获取匹配的文件列表
-	cmd := exec.Command("ssh", fmt.Sprintf("root@%s", serverIP), "ls -1", remotePattern)
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list remote files: %w, cmd: %s", err, cmd.String())
-	}
-
-	// 解析输出得到文件列表
-	files := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(files) == 0 || (len(files) == 1 && files[0] == "") {
-		return nil, fmt.Errorf("no files found matching pattern: %s", remotePattern)
-	}
-
-	return files, nil
-}
-
-// downloadRemoteFile scp下载远程文件到本地临时目录
-func (s *DistributionService) downloadRemoteFile(remotePath string) ([]string, error) {
-	// 解析远程文件路径
-	remotePath = strings.TrimPrefix(remotePath, "file:///")
-	log.Printf("Downloading remote file from path: %s", remotePath)
-	parts := strings.SplitN(remotePath, "/", 2)
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid remote file path: %s", remotePath)
-	}
-
-	serverIP := parts[0]
-	remoteFilePath := "/" + parts[1]
-
-	// 创建本地临时目录
-	tempDir := "./"
-	downloadDir := filepath.Join(tempDir, "dmp_downloads")
-	if err := os.MkdirAll(downloadDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create download directory: %w", err)
-	}
-
-	// 获取匹配的远程文件列表
-	matchedFiles, err := s.findRemoteFiles(serverIP, remoteFilePath)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Printf("Found %d matching files on remote server", len(matchedFiles))
-
-	// 下载所有匹配的文件
-	var localPaths []string
-	timestamp := time.Now().Format("20060102150405")
-
-	for idx, remoteFile := range matchedFiles {
-		// 生成本地文件路径
-		fileName := filepath.Base(remoteFile)
-		localPath := filepath.Join(downloadDir, fmt.Sprintf("%s_%d_%s", timestamp, idx, fileName))
-
-		// 使用scp下载文件
-		cmd := exec.Command("scp", fmt.Sprintf("root@%s:%s", serverIP, remoteFile), localPath)
-		cmd.Stderr = os.Stderr
-
-		log.Printf("Downloading file %d/%d: %s -> %s", idx+1, len(matchedFiles), remoteFile, localPath)
-
-		if err := cmd.Run(); err != nil {
-			// 如果下载失败，清理已下载的文件
-			for _, path := range localPaths {
-				s.cleanupTempFile(path)
-			}
-			return nil, fmt.Errorf("failed to download file %s: %w", remoteFile, err)
-		}
-
-		localPaths = append(localPaths, localPath)
-	}
-
-	return localPaths, nil
-}
-
-// streamProcessFile 流式处理大文件
-func (s *DistributionService) streamProcessFile(task *module.Distribution, processor func([]map[string]string) error) error {
-	var localPaths []string
-	var err error
-
-	// 检查是否是远程文件
-	if strings.HasPrefix(task.Path, "file://") {
-		// 下载远程文件 - scp 逻辑
-		//localPaths, err = s.downloadRemoteFile(task.Path)
-		// 下载远程文件 - api 接口下载
-		localPaths, err = s.downloadApiFile(task.Path)
-		if err != nil {
-			log.Printf("Failed to download remote files %s: %v", task.Path, err)
-			return fmt.Errorf("download files error: %w", err)
-		}
-		// 确保在处理完成后清理所有临时文件
-		defer func() {
-			for _, path := range localPaths {
-				s.cleanupTempFile(path)
-			}
-		}()
-		log.Printf("Successfully downloaded %d remote files", len(localPaths))
-	} else {
-		localPaths = []string{task.Path}
-	}
-
-	var totalProcessed int64
-	// 处理所有文件
-	for fileIdx, filePath := range localPaths {
-		log.Printf("Processing file %d/%d: %s", fileIdx+1, len(localPaths), filePath)
-
-		// 打开文件进行处理
-		file, err := os.Open(filePath)
-		if err != nil {
-			log.Printf("Failed to open file %s: %v", filePath, err)
-			return fmt.Errorf("open file error: %w", err)
-		}
-
-		var (
-			scanner   = bufio.NewScanner(file)
-			batch     = make([]map[string]string, 0, StreamBatchSize)
-			batchSize int64
-		)
-
-		// 增加扫描器的缓冲区大小
-		buffer := make([]byte, 0, 1024*1024)
-		scanner.Buffer(buffer, 1024*1024)
-
-		// 使用匿名函数确保文件正确关闭
-		processErr := func() error {
-			defer file.Close()
-
-			for scanner.Scan() {
-				if !s.isRunning {
-					return fmt.Errorf("service stopped")
-				}
-
-				deviceInfo, valid := s.parseLine(scanner.Text(), task)
-				if !valid {
-					continue
-				}
-
-				batch = append(batch, deviceInfo)
-				batchSize++
-
-				// 批次处理
-				if len(batch) >= StreamBatchSize {
-					if err := processor(batch); err != nil {
-						return fmt.Errorf("process batch error: %w", err)
-					}
-					s.updateProgress(task.ID, batchSize)
-					totalProcessed += batchSize
-					batch = batch[:0]
-					batchSize = 0
-				}
-			}
-
-			// 处理剩余数据
-			if len(batch) > 0 {
-				if err := processor(batch); err != nil {
-					return fmt.Errorf("process final batch error: %w", err)
-				}
-				s.updateProgress(task.ID, batchSize)
-				totalProcessed += batchSize
-			}
-
-			return scanner.Err()
-		}()
-
-		if processErr != nil {
-			return fmt.Errorf("error processing file %s: %w", filePath, processErr)
-		}
-	}
-
-	log.Printf("Total processed lines across all files: %d", totalProcessed)
-	// 确保最终进度被写入数据库
-	s.flushProgress()
-
-	return nil
-}
-
-// downloadApiFile 通过API接口下载文件
-func (s *DistributionService) downloadApiFile(remotePath string) ([]string, error) {
-	// 解析远程文件路径
-	remotePath = strings.TrimPrefix(remotePath, "file:///")
-	log.Printf("Downloading files via API from path: %s", remotePath)
-	parts := strings.SplitN(remotePath, "/", 2)
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid remote file path: %s", remotePath)
-	}
-
-	serverIP := parts[0]
-	remotePrefix := "/" + parts[1]
-
-	// 获取文件列表
-	listURL := fmt.Sprintf("http://%s:6090/file/v1/download?prefix=%s", serverIP, remotePrefix)
-	resp, err := http.Get(listURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch file list: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch file list, status code: %d", resp.StatusCode)
-	}
-
-	var fileList struct {
-		Count int `json:"count"`
-		Files []struct {
-			Filename string `json:"filename"`
-			Path     string `json:"path"`
-			Size     int    `json:"size"`
-		} `json:"files"`
-		Status string `json:"status"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&fileList); err != nil {
-		return nil, fmt.Errorf("failed to decode file list response: %w", err)
-	}
-
-	if fileList.Status != "success" {
-		return nil, fmt.Errorf("failed to fetch file list, status: %s", fileList.Status)
-	}
-
-	log.Printf("Found %d files to download", fileList.Count)
-
-	// 下载文件到本地目录
-	tempDir := "./"
-	downloadDir := filepath.Join(tempDir, "dmp_downloads")
-	if err := os.MkdirAll(downloadDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create download directory: %w", err)
-	}
-
-	var localPaths []string
-	for _, file := range fileList.Files {
-		downloadURL := fmt.Sprintf("http://%s:6090/file/v1/download/file?path=%s", serverIP, file.Path)
-		localPath := filepath.Join(downloadDir, file.Filename)
-
-		resp, err := http.Get(downloadURL)
-		if err != nil {
-			return nil, fmt.Errorf("failed to download file %s: %w", file.Path, err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("failed to download file %s, status code: %d", file.Path, resp.StatusCode)
-		}
-
-		out, err := os.Create(localPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create local file %s: %w", localPath, err)
-		}
-		defer out.Close()
-
-		if _, err := io.Copy(out, resp.Body); err != nil {
-			return nil, fmt.Errorf("failed to save file %s: %w", localPath, err)
-		}
-
-		localPaths = append(localPaths, localPath)
-		log.Printf("Successfully downloaded file: %s", localPath)
-	}
-
-	return localPaths, nil
-}
-
-// cleanupTempFile 清理临时文件
-func (s *DistributionService) cleanupTempFile(path string) {
-	if strings.Contains(path, "dmp_downloads") {
-		if err := os.Remove(path); err != nil {
-			log.Printf("Failed to cleanup temp file %s: %v", path, err)
-		} else {
-			log.Printf("Successfully cleaned up temp file: %s", path)
-		}
-	}
-}
-
-// parseLine 优化后的行解析
-func (s *DistributionService) parseLine(line string, task *module.Distribution) (map[string]string, bool) {
-	fields := strings.Split(line, "\t")
-	if len(fields) == 0 {
-		return nil, false
-	}
-
-	deviceInfo := make(map[string]string)
-	if task.UserID == 1 {
-		deviceInfo["user_id"] = fields[1]
-	}
-	if task.Oaid == 1 && len(fields) >= 2 {
-		if oaid := strings.TrimSpace(fields[2]); oaid != "" {
-			deviceInfo["oaid"] = oaid
-		}
-	}
-	if task.Caid == 1 && len(fields) >= 3 {
-		// 处理可能包含多个CAID的情况
-		if caids := strings.Split(fields[3], ","); len(caids) > 0 {
-			for i, caid := range caids {
-				if caid = strings.TrimSpace(caid); caid != "" {
-					deviceInfo[fmt.Sprintf("caid_%d", i+1)] = caid
-				}
-			}
-		}
-	}
-	if task.Idfa == 1 && len(fields) >= 4 {
-		if idfa := strings.TrimSpace(fields[4]); idfa != "" {
-			deviceInfo["idfa"] = idfa
-		}
-	}
-	if task.Imei == 1 && len(fields) >= 5 {
-		if imei := strings.TrimSpace(fields[5]); imei != "" {
-			deviceInfo["imei"] = imei
-		}
-	}
-	return deviceInfo, len(deviceInfo) > 0
-}
-*/
 
 // initTaskStatus 任务初始化
 func (s *DistributionService) initTaskStatus(task *module.Distribution) error {
@@ -548,45 +231,76 @@ func (s *DistributionService) initTaskStatus(task *module.Distribution) error {
 
 // processByStrategyID 通过StrategyID从Doris获取最新user_set，查mapping表，整理为batch推送redis，并兼容进度/状态
 func (s *DistributionService) processByStrategyID(task *module.Distribution, strategyID int64) error {
-	// 获取保存地址
-	baseAddress := core.GetConfig().OUTPUT_DIR
-	if baseAddress == "" {
-		baseAddress = "./output" // 默认输出目录
-	}
-	// 创建输出目录
-	if err := os.MkdirAll(baseAddress, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
-	}
-	// 生成文件名，只包含任务ID，不包含时间戳，确保同一任务写入同一文件
-	fileName := fmt.Sprintf("task_%d_%s.csv", task.ID, time.Now().Format("200601021504"))
-	filePath := filepath.Join(baseAddress, fileName)
-	s.taskFilePaths.Store(task.ID, filePath)
-
 	dorisDB := mysqldb.Doris
 	if dorisDB == nil {
 		return fmt.Errorf("doris connection is not initialized")
 	}
 
-	// 查 hash_id 范围
-	var minHashID, maxHashID int64
-	rangeQuery := `SELECT MIN(hash_id), MAX(hash_id) FROM dmp_user_mapping_v4`
-	if err := dorisDB.QueryRow(rangeQuery).Scan(&minHashID, &maxHashID); err != nil {
-		return fmt.Errorf("query hash_id range error: %w", err)
+	// 创建临时表
+	tempTableName := fmt.Sprintf("temp_device_ids_%d_%d", task.ID, time.Now().Unix())
+	if err := s.createTempTable(dorisDB, tempTableName); err != nil {
+		return fmt.Errorf("create temp table error: %w", err)
 	}
-	log.Printf("hash_id range: [%d, %d]", minHashID, maxHashID)
 
-	// 分区并发查，避免OFFSET
-	const partitionSize = int64(50000000) // 每分区5000万，可根据资源调整
-	const maxConcurrency = 8              // 最大并发数
+	// 确保临时表在函数结束时被删除
+	defer func() {
+		s.dropTempTable(dorisDB, tempTableName)
+	}()
+
+	// 构建查询字段 - 只查询需要的device_id字段
+	// 构建查询字段
+	var selectFields []string
+	var imei, oaid, caid, idfa, user_id string
+	var scanFields []interface{}
+	if task.Imei == 1 {
+		selectFields = append(selectFields, "imei")
+		scanFields = append(scanFields, &imei)
+	}
+	if task.Oaid == 1 {
+		selectFields = append(selectFields, "oaid")
+		scanFields = append(scanFields, &oaid)
+	}
+	if task.Caid == 1 {
+		selectFields = append(selectFields, "caid")
+		scanFields = append(scanFields, &caid)
+	}
+	if task.Idfa == 1 {
+		selectFields = append(selectFields, "idfa")
+		scanFields = append(scanFields, &idfa)
+	}
+	if task.UserID == 1 {
+		selectFields = append(selectFields, "user_id")
+		scanFields = append(scanFields, &user_id)
+	}
+
+	if len(selectFields) == 0 {
+		return fmt.Errorf("no fields selected for task %d", task.ID)
+	}
+
+	// 将查询结果保存到临时表
+	var totalCount int64
+	var err error
+	if totalCount, err = s.saveToTempTable(dorisDB, selectFields, tempTableName, strategyID, task); err != nil {
+		return fmt.Errorf("save to temp table error: %w", err)
+	}
+	if totalCount == 0 {
+		log.Printf("No records found for task %d", task.ID)
+		s.finalizeTask(task, TaskFailStatus, nil)
+		return nil
+	}
+
+	const partitionSize = int64(5000000) // 每分区500万，可根据资源调整
+	const maxConcurrency = 8             // 最大并发数
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, maxConcurrency)
 	var firstErr error
 	var mu sync.Mutex
+	var start int64
 
-	for start := minHashID; start <= maxHashID; start += partitionSize {
+	for start = 0; start <= totalCount; start += partitionSize {
 		end := start + partitionSize
-		if end > maxHashID+1 {
-			end = maxHashID + 1
+		if end > totalCount {
+			end = totalCount
 		}
 		wg.Add(1)
 		sem <- struct{}{}
@@ -594,38 +308,13 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			var selectFields []string
-			var scanFields []interface{}
-			var userID, oaid, caid, idfa, imei string
-			if task.UserID == 1 {
-				selectFields = append(selectFields, "user_id")
-				scanFields = append(scanFields, &userID)
-			}
-			if task.Oaid == 1 {
-				selectFields = append(selectFields, "oaid")
-				scanFields = append(scanFields, &oaid)
-			}
-			if task.Caid == 1 {
-				selectFields = append(selectFields, "caid")
-				scanFields = append(scanFields, &caid)
-			}
-			if task.Idfa == 1 {
-				selectFields = append(selectFields, "idfa")
-				scanFields = append(scanFields, &idfa)
-			}
-			if task.Imei == 1 {
-				selectFields = append(selectFields, "imei")
-				scanFields = append(scanFields, &imei)
-			}
+			query := fmt.Sprintf(`SELECT %s FROM %s
+				WHERE id >= ? AND id < ? )`,
+				strings.Join(selectFields, ", "), tempTableName)
 
-			query := fmt.Sprintf(`SELECT %s FROM dmp_user_mapping_v4
-				WHERE hash_id >= ? AND hash_id < ? AND bitmap_contains(
-					(SELECT user_set FROM dmp_crowd_user_bitmap WHERE crowd_rule_id = ? ORDER BY event_date DESC LIMIT 1),
-                	hash_id
-				)`,
-				strings.Join(selectFields, ", "))
-			log.Printf("Executing query: %s with range [%d, %d) and strategyID %d", query, start, end, strategyID)
-			rows, err := dorisDB.Query(query, start, end, strategyID)
+			log.Printf("Executing query: %s with range [%d, %d)", query, start, end)
+
+			rows, err := dorisDB.Query(query, start, end)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -639,19 +328,19 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 			batch := make([]map[string]string, 0, StreamBatchSize)
 			processed := 0
 			for rows.Next() {
-				log.Printf("Reading row... userID: %s, oaid: %s, caid: %s, idfa: %s, imei: %s", userID, oaid, caid, idfa, imei)
+				log.Printf("Reading row... userID: %s, oaid: %s, caid: %s, idfa: %s, imei: %s", user_id, oaid, caid, idfa, imei)
 				if err := rows.Scan(scanFields...); err != nil {
 					log.Printf("Scan error: %v", err)
 					continue
 				}
 				item := make(map[string]string)
-				if task.UserID == 1 && userID != "" {
-					item["user_id"] = userID
+				if user_id != "" {
+					item["user_id"] = user_id
 				}
-				if task.Oaid == 1 && oaid != "" {
+				if oaid != "" {
 					item["oaid"] = oaid
 				}
-				if task.Caid == 1 && caid != "" {
+				if caid != "" {
 					caids := strings.Split(caid, ",")
 					for k, c := range caids {
 						c = strings.TrimSpace(c)
@@ -660,21 +349,16 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 						}
 					}
 				}
-				if task.Idfa == 1 && idfa != "" {
+				if idfa != "" {
 					item["idfa"] = idfa
 				}
-				if task.Imei == 1 && imei != "" {
+				if imei != "" {
 					item["imei"] = imei
 				}
 				if len(item) > 0 {
 					batch = append(batch, item)
 				}
 				if len(batch) >= StreamBatchSize {
-					// 保存batch数据到文件
-					if err := s.saveBatchToFile(task, batch, selectFields, filePath); err != nil {
-						log.Printf("Failed to save batch to file: %v", err)
-					}
-
 					if err := s.processBatch(task, batch); err != nil {
 						mu.Lock()
 						if firstErr == nil {
@@ -690,11 +374,6 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 				}
 			}
 			if len(batch) > 0 {
-				// 保存batch数据到文件
-				if err := s.saveBatchToFile(task, batch, selectFields, filePath); err != nil {
-					log.Printf("Failed to save batch to file: %v", err)
-				}
-
 				if err := s.processBatch(task, batch); err != nil {
 					mu.Lock()
 					if firstErr == nil {
@@ -712,16 +391,81 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 	}
 	wg.Wait()
 
-	// 分区全部完成后，刷新进度
-	// s.flushProgress()
-
-	if firstErr != nil {
-		s.finalizeTask(task, TaskFailStatus, firstErr)
-		return firstErr
-	}
-
+	s.flushProgress() // 确保所有进度都被刷新到数据库
 	s.finalizeTask(task, TaskDoneStatus, nil)
 	return nil
+}
+
+// createTempTable 创建临时表
+func (s *DistributionService) createTempTable(db *sql.DB, tableName string) error {
+	createTableSQL := fmt.Sprintf(`
+		CREATE TEMPORARY TABLE %s (
+			id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			imei VARCHAR(128) NOT NULL,
+			oaid VARCHAR(128) NOT NULL,
+			caid VARCHAR(128) NOT NULL,
+			idfa VARCHAR(128) NOT NULL,
+			user_id VARCHAR(128) NOT NULL,
+			INDEX idx_imei (imei),
+			INDEX idx_oaid (oaid),
+			INDEX idx_caid (caid),
+			INDEX idx_idfa (idfa),
+			INDEX idx_user_id (user_id)
+		)
+	`, tableName)
+
+	_, err := db.Exec(createTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create temp table %s: %w", tableName, err)
+	}
+
+	log.Printf("Created temporary table: %s", tableName)
+	return nil
+}
+
+// dropTempTable 删除临时表
+func (s *DistributionService) dropTempTable(db *sql.DB, tableName string) {
+	dropTableSQL := fmt.Sprintf("DROP TEMPORARY TABLE IF EXISTS %s", tableName)
+	if _, err := db.Exec(dropTableSQL); err != nil {
+		log.Printf("Warning: failed to drop temp table %s: %v", tableName, err)
+	} else {
+		log.Printf("Dropped temporary table: %s", tableName)
+	}
+}
+
+// saveToTempTable 将查询结果保存到临时表
+func (s *DistributionService) saveToTempTable(db *sql.DB, selectFields []string, tempTableName string, strategyID int64, task *module.Distribution) (int64, error) {
+
+	// 构建插入字段和选择字段
+	insertFields := strings.Join(selectFields, ", ")
+	selectFieldsStr := strings.Join(selectFields, ", ")
+
+	// 直接使用 INSERT ... SELECT 语句
+	insertSQL := fmt.Sprintf(`
+		INSERT INTO %s (%s)
+		SELECT %s FROM dmp_user_mapping_v4
+		WHERE bitmap_contains(
+			(SELECT user_set FROM dmp_crowd_user_bitmap WHERE crowd_rule_id = ? ORDER BY event_date DESC LIMIT 1),
+			user_hash_id
+		)
+	`, tempTableName, insertFields, selectFieldsStr)
+
+	log.Printf("Executing INSERT ... SELECT query: %s with strategyID %d", insertSQL, strategyID)
+
+	startTime := time.Now()
+
+	result, err := db.Exec(insertSQL, strategyID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to insert data into temp table: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	log.Printf("Inserted %d records into temp table %s, took %v", rowsAffected, tempTableName, time.Since(startTime))
+	return rowsAffected, nil
 }
 
 // processBatch 处理单个批次
@@ -759,19 +503,6 @@ func (s *DistributionService) processBatch(task *module.Distribution, batch []ma
 func (s *DistributionService) finalizeTask(task *module.Distribution, status int, err error) error {
 	if status == TaskFailStatus {
 		log.Printf("Task %d failed: %v", task.ID, err)
-	} else if status == TaskDoneStatus {
-		// 任务成功完成时，保存文件路径到数据库
-		if filePath, exists := s.taskFilePaths.Load(task.ID); exists {
-			if path, ok := filePath.(string); ok {
-				if updateErr := s.distModel.UpdatePath(task.ID, path); updateErr != nil {
-					log.Printf("Failed to update file path for task %d: %v", task.ID, updateErr)
-				} else {
-					log.Printf("Successfully updated file path for task %d: %s", task.ID, path)
-				}
-				// 清理内存中的文件路径记录
-				s.taskFilePaths.Delete(task.ID)
-			}
-		}
 	}
 	return s.distModel.UpdateStatus(task.ID, status)
 }
@@ -789,16 +520,12 @@ func (s *DistributionService) flushProgress() {
 		lastDBCount := atomic.LoadInt64(&progress.lastDBCount)
 
 		log.Printf("Flushing progress for task %d: currentCount=%d, lastDBCount=%d, lastUpdate=%v", taskID, currentCount, lastDBCount, progress.lastUpdate)
-		// 只有当处理行数显著增加或距离上次更新时间较长时才更新
-		if currentCount-lastDBCount >= MinProgressDiff || now.Sub(progress.lastUpdate) >= ProgressUpdateInterval {
-			if err := s.distModel.UpdateLineCount(taskID, currentCount); err != nil {
-				log.Printf("Failed to update line count for task %d: %v", taskID, err)
-			} else {
-				atomic.StoreInt64(&progress.lastDBCount, currentCount)
-				progress.lastUpdate = now
-			}
+		if err := s.distModel.UpdateLineCount(taskID, currentCount); err != nil {
+			log.Printf("Failed to update line count for task %d: %v", taskID, err)
+		} else {
+			atomic.StoreInt64(&progress.lastDBCount, currentCount)
+			progress.lastUpdate = now
 		}
-
 		return true
 	})
 }
@@ -828,6 +555,117 @@ func (s *DistributionService) updateProgress(taskID int, delta int64) {
 
 	// 原子递增计数
 	atomic.StoreInt64(&progress.currentCount, delta)
+}
+
+// saveFileByStrategyID 通过StrategyID从Doris获取最新user_set，查mapping表，整理为batch保存数据文件
+func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, strategyID int64, duration time.Duration) error {
+	// 获取保存地址
+	baseAddress := core.GetConfig().OUTPUT_DIR
+	if baseAddress == "" {
+		baseAddress = "./output" // 默认输出目录
+	}
+	// 创建输出目录
+	if err := os.MkdirAll(baseAddress, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+	// 生成文件名，只包含任务ID，不包含时间戳，确保同一任务写入同一文件
+	log.Print("Generating file name for task", task.ID, "with duration", duration)
+	fileName := fmt.Sprintf("task_%d_%s_%s.csv", task.ID, time.Now().Format("200601021504"), duration.String())
+	filePath := filepath.Join(baseAddress, fileName)
+	s.taskFilePaths.Store(task.ID, filePath)
+
+	dorisDB := mysqldb.Doris
+	if dorisDB == nil {
+		return fmt.Errorf("doris connection is not initialized")
+	}
+
+	var selectFields []string
+	var scanFields []interface{}
+	var userID, oaid, caid, idfa, imei string
+	if task.UserID == 1 {
+		selectFields = append(selectFields, "user_id")
+		scanFields = append(scanFields, &userID)
+	}
+	if task.Oaid == 1 {
+		selectFields = append(selectFields, "oaid")
+		scanFields = append(scanFields, &oaid)
+	}
+	if task.Caid == 1 {
+		selectFields = append(selectFields, "caid")
+		scanFields = append(scanFields, &caid)
+	}
+	if task.Idfa == 1 {
+		selectFields = append(selectFields, "idfa")
+		scanFields = append(scanFields, &idfa)
+	}
+	if task.Imei == 1 {
+		selectFields = append(selectFields, "imei")
+		scanFields = append(scanFields, &imei)
+	}
+
+	query := fmt.Sprintf(`SELECT %s FROM dmp_user_mapping_v4
+		WHERE bitmap_contains(
+			(SELECT user_set FROM dmp_crowd_user_bitmap WHERE crowd_rule_id = ? ORDER BY event_date DESC LIMIT 1),
+			hash_id
+		)`,
+		strings.Join(selectFields, ", "))
+	log.Printf("Executing query: %s with range and strategyID %d", query, strategyID)
+	rows, err := dorisDB.Query(query, strategyID)
+	if err != nil {
+		return fmt.Errorf("query mapping error in range: %w", err)
+	}
+	defer rows.Close()
+
+	batch := make([]map[string]string, 0)
+	processed := 0
+
+	for rows.Next() {
+		//og.Printf("Reading row... userID: %s, oaid: %s, caid: %s, idfa: %s, imei: %s", userID, oaid, caid, idfa, imei)
+		if err := rows.Scan(scanFields...); err != nil {
+			log.Printf("Scan error: %v", err)
+			continue
+		}
+		item := make(map[string]string)
+		if task.UserID == 1 && userID != "" {
+			item["user_id"] = userID
+		}
+		if task.Oaid == 1 && oaid != "" {
+			item["oaid"] = oaid
+		}
+		if task.Caid == 1 && caid != "" {
+			caids := strings.Split(caid, ",")
+			for k, c := range caids {
+				c = strings.TrimSpace(c)
+				if c != "" {
+					item[fmt.Sprintf("caid_%d", k+1)] = c
+				}
+			}
+		}
+		if task.Idfa == 1 && idfa != "" {
+			item["idfa"] = idfa
+		}
+		if task.Imei == 1 && imei != "" {
+			item["imei"] = imei
+		}
+		if len(item) > 0 {
+			batch = append(batch, item)
+		}
+		if len(batch) >= StreamBatchSize {
+			// 保存batch数据到文件
+			if err := s.saveBatchToFile(task, batch, selectFields, filePath); err != nil {
+				log.Printf("Failed to save batch to file: %v", err)
+			}
+			batch = batch[:0]
+		}
+	}
+	if len(batch) > 0 {
+		// 保存batch数据到文件
+		if err := s.saveBatchToFile(task, batch, selectFields, filePath); err != nil {
+			log.Printf("Failed to save batch to file: %v", err)
+		}
+	}
+	log.Printf("Processed %d records for hash_id range", processed)
+	return nil
 }
 
 // saveBatchToFile 将batch数据按selectFields顺序保存到文件，返回文件路径
