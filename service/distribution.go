@@ -1,9 +1,12 @@
 package service
 
 import (
+	"archive/zip"
 	"context"
+	"crypto/md5"
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -102,38 +105,14 @@ func (s *DistributionService) taskProcessor() {
 
 			s.wg.Add(1)
 			go func(t *module.Distribution) {
-				begin := time.Now()
 				defer s.wg.Done()
 				defer func() { <-s.workerSem }() // 释放工作协程信号量
 
-				startTime := time.Now()
 				log.Printf("Processing task %d started", t.ID)
 
 				if err := s.processTask(t); err != nil {
-					log.Printf("Task %d failed after %v: %v", t.ID, time.Since(startTime), err)
 					s.finalizeTask(t, TaskFailStatus, err)
 					return
-				}
-				log.Printf("Task %d completed successfully after %v", t.ID, time.Since(startTime))
-				s.distModel.UpdateExecTime(t.ID, time.Now().Unix())
-
-				// 保存数据文件
-				end := time.Now()
-				log.Printf("Task %d processing time: %v", t.ID, end.Sub(begin))
-				if err := s.saveFileByStrategyID(task, int64(task.StrategyID), end.Sub(begin)); err != nil {
-					log.Printf("SaveFile %d failed after %v: %v", t.ID, time.Since(startTime), err)
-				}
-				// 任务成功完成时，保存文件路径到数据库
-				if filePath, exists := s.taskFilePaths.Load(task.ID); exists {
-					if path, ok := filePath.(string); ok {
-						if updateErr := s.distModel.UpdatePath(task.ID, path); updateErr != nil {
-							log.Printf("Failed to update file path for task %d: %v", task.ID, updateErr)
-						} else {
-							log.Printf("Successfully updated file path for task %d: %s", task.ID, path)
-						}
-						// 清理内存中的文件路径记录
-						s.taskFilePaths.Delete(task.ID)
-					}
 				}
 			}(task)
 		case <-time.After(30 * time.Second): // 30秒超时，可根据需要调整
@@ -207,30 +186,6 @@ func (s *DistributionService) processTask(task *module.Distribution) error {
 		return err
 	}
 
-	// 处理策略ID分发
-	if err := s.processByStrategyID(task, int64(task.StrategyID)); err != nil {
-		s.finalizeTask(task, TaskFailStatus, err)
-		return err
-	}
-
-	// 3. 最终状态更新
-	return s.finalizeTask(task, TaskDoneStatus, nil)
-}
-
-// initTaskStatus 任务初始化
-func (s *DistributionService) initTaskStatus(task *module.Distribution) error {
-	if err := s.distModel.UpdateStatus(task.ID, TaskRunStatus); err != nil {
-		return fmt.Errorf("update status error: %w", err)
-	}
-	// 初始化行数为0
-	if err := s.distModel.UpdateLineCountZero(task.ID, 0); err != nil {
-		return fmt.Errorf("init line count error: %w", err)
-	}
-	return nil
-}
-
-// processByStrategyID 通过StrategyID从Doris获取最新user_set，查mapping表，整理为batch推送redis，并兼容进度/状态
-func (s *DistributionService) processByStrategyID(task *module.Distribution, strategyID int64) error {
 	dorisDB := mysqldb.Doris
 	if dorisDB == nil {
 		return fmt.Errorf("doris connection is not initialized")
@@ -247,6 +202,51 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 		s.dropTempTable(dorisDB, tempTableName)
 	}()
 
+	// 处理策略ID分发
+	if err := s.processByStrategyID(task, int64(task.StrategyID), dorisDB, tempTableName); err != nil {
+		s.finalizeTask(task, TaskFailStatus, err)
+		return err
+	} else {
+		s.finalizeTask(task, TaskDoneStatus, nil)
+		log.Printf("Task %d completed successfully", task.ID)
+		s.distModel.UpdateExecTime(task.ID, time.Now().Unix())
+	}
+
+	// 将数据保存到文件中
+	// 保存数据文件
+	if err := s.saveFileByStrategyID(task, int64(task.StrategyID), dorisDB, tempTableName); err != nil {
+		log.Printf("SaveFile %d failed: %v", task.ID, err)
+	}
+	// 任务成功完成时，保存文件路径到数据库
+	if filePath, exists := s.taskFilePaths.Load(task.ID); exists {
+		if path, ok := filePath.(string); ok {
+			if updateErr := s.distModel.UpdatePath(task.ID, path); updateErr != nil {
+				log.Printf("Failed to update file path for task %d: %v", task.ID, updateErr)
+			} else {
+				log.Printf("Successfully updated file path for task %d: %s", task.ID, path)
+			}
+			// 清理内存中的文件路径记录
+			s.taskFilePaths.Delete(task.ID)
+		}
+	}
+
+	return nil
+}
+
+// initTaskStatus 任务初始化
+func (s *DistributionService) initTaskStatus(task *module.Distribution) error {
+	if err := s.distModel.UpdateStatus(task.ID, TaskRunStatus); err != nil {
+		return fmt.Errorf("update status error: %w", err)
+	}
+	// 初始化行数为0
+	if err := s.distModel.UpdateLineCountZero(task.ID, 0); err != nil {
+		return fmt.Errorf("init line count error: %w", err)
+	}
+	return nil
+}
+
+// processByStrategyID 通过StrategyID从Doris获取最新user_set，查mapping表，整理为batch推送redis，并兼容进度/状态
+func (s *DistributionService) processByStrategyID(task *module.Distribution, strategyID int64, dorisDB *sql.DB, tempTableName string) error {
 	// 构建查询字段 - 只查询需要的device_id字段
 	// 构建查询字段
 	var selectFields []string
@@ -557,31 +557,25 @@ func (s *DistributionService) updateProgress(taskID int, delta int64) {
 	atomic.StoreInt64(&progress.currentCount, delta)
 }
 
-// saveFileByStrategyID 通过StrategyID从Doris获取最新user_set，查mapping表，整理为batch保存数据文件
-func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, strategyID int64, duration time.Duration) error {
+// saveFileByStrategyID 从临时表获取数据，按数据类型分文件保存，压缩成zip
+func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, strategyID int64, dorisDB *sql.DB, tempTableName string) error {
 	// 获取保存地址
 	baseAddress := core.GetConfig().OUTPUT_DIR
 	if baseAddress == "" {
 		baseAddress = "./output" // 默认输出目录
 	}
-	// 创建输出目录
-	if err := os.MkdirAll(baseAddress, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
-	}
-	// 生成文件名，只包含任务ID，不包含时间戳，确保同一任务写入同一文件
-	log.Print("Generating file name for task", task.ID, "with duration", duration)
-	fileName := fmt.Sprintf("task_%d_%s_%s.csv", task.ID, time.Now().Format("200601021504"), duration.String())
-	filePath := filepath.Join(baseAddress, fileName)
-	s.taskFilePaths.Store(task.ID, filePath)
 
-	dorisDB := mysqldb.Doris
-	if dorisDB == nil {
-		return fmt.Errorf("doris connection is not initialized")
+	// 创建任务专用文件夹
+	taskDir := filepath.Join(baseAddress, fmt.Sprintf("task_%d_%s", task.ID, time.Now().Format("200601021504")))
+	if err := os.MkdirAll(taskDir, 0755); err != nil {
+		return fmt.Errorf("failed to create task directory: %w", err)
 	}
 
+	// 构建查询字段
 	var selectFields []string
 	var scanFields []interface{}
 	var userID, oaid, caid, idfa, imei string
+
 	if task.UserID == 1 {
 		selectFields = append(selectFields, "user_id")
 		scanFields = append(scanFields, &userID)
@@ -603,121 +597,292 @@ func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, st
 		scanFields = append(scanFields, &imei)
 	}
 
-	query := fmt.Sprintf(`SELECT %s FROM dmp_user_mapping_v4
-		WHERE bitmap_contains(
-			(SELECT user_set FROM dmp_crowd_user_bitmap WHERE crowd_rule_id = ? ORDER BY event_date DESC LIMIT 1),
-			hash_id
-		)`,
-		strings.Join(selectFields, ", "))
-	log.Printf("Executing query: %s with range and strategyID %d", query, strategyID)
-	rows, err := dorisDB.Query(query, strategyID)
-	if err != nil {
-		return fmt.Errorf("query mapping error in range: %w", err)
+	if len(selectFields) == 0 {
+		return fmt.Errorf("no fields selected for task %d", task.ID)
 	}
-	defer rows.Close()
 
-	batch := make([]map[string]string, 0)
-	processed := 0
+	// 文件管理器，每种数据类型对应一个文件管理器
+	const maxFileSize = 1024 * 1024 * 1024 // 1GB
+	fileManagers := make(map[string]*fileManager)
 
-	for rows.Next() {
-		//og.Printf("Reading row... userID: %s, oaid: %s, caid: %s, idfa: %s, imei: %s", userID, oaid, caid, idfa, imei)
-		if err := rows.Scan(scanFields...); err != nil {
-			log.Printf("Scan error: %v", err)
-			continue
-		}
-		item := make(map[string]string)
-		if task.UserID == 1 && userID != "" {
-			item["user_id"] = userID
-		}
-		if task.Oaid == 1 && oaid != "" {
-			item["oaid"] = oaid
-		}
-		if task.Caid == 1 && caid != "" {
-			caids := strings.Split(caid, ",")
-			for k, c := range caids {
-				c = strings.TrimSpace(c)
-				if c != "" {
-					item[fmt.Sprintf("caid_%d", k+1)] = c
+	for _, field := range selectFields {
+		fileManagers[field] = newFileManager(taskDir, field, maxFileSize)
+	}
+
+	// 获取总记录数
+	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, tempTableName)
+	var totalCount int64
+	if err := dorisDB.QueryRow(countQuery).Scan(&totalCount); err != nil {
+		return fmt.Errorf("failed to get total count: %w", err)
+	}
+
+	log.Printf("Total records to process: %d", totalCount)
+
+	// 分批处理数据，每次处理100万条，并行处理
+	const batchSize = int64(1000000) // 100万条
+	const maxConcurrency = 4         // 最大并行数，可根据服务器性能调整
+	var processed int64
+
+	// 计算总批次数
+	totalBatches := (totalCount + batchSize - 1) / batchSize
+	log.Printf("Will process %d batches with max concurrency %d", totalBatches, maxConcurrency)
+
+	// 创建协程池和任务通道
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+
+	// 并行处理各个批次
+	for batchNum := int64(0); batchNum < totalBatches; batchNum++ {
+		wg.Add(1)
+		sem <- struct{}{} // 获取信号量
+
+		go func(batchIndex int64) {
+			defer wg.Done()
+			defer func() { <-sem }() // 释放信号量
+
+			// 计算当前批次的范围
+			offset := batchIndex * batchSize
+			endOffset := offset + batchSize
+			if endOffset > totalCount {
+				endOffset = totalCount
+			}
+
+			// 分批查询数据
+			query := fmt.Sprintf(`SELECT %s FROM %s WHERE id >= ? AND id < ?`,
+				strings.Join(selectFields, ", "), tempTableName)
+
+			log.Printf("Processing batch %d/%d: offset=%d, endOffset=%d", batchIndex+1, totalBatches, offset, endOffset)
+
+			rows, err := dorisDB.Query(query, offset, endOffset)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("query temp table error at batch %d (offset %d): %w", batchIndex, offset, err)
 				}
+				mu.Unlock()
+				return
 			}
-		}
-		if task.Idfa == 1 && idfa != "" {
-			item["idfa"] = idfa
-		}
-		if task.Imei == 1 && imei != "" {
-			item["imei"] = imei
-		}
-		if len(item) > 0 {
-			batch = append(batch, item)
-		}
-		if len(batch) >= StreamBatchSize {
-			// 保存batch数据到文件
-			if err := s.saveBatchToFile(task, batch, selectFields, filePath); err != nil {
-				log.Printf("Failed to save batch to file: %v", err)
+			defer rows.Close()
+
+			// 处理当前批次的数据
+			batchProcessed := 0
+			for rows.Next() {
+				if err := rows.Scan(scanFields...); err != nil {
+					log.Printf("Scan error in batch %d: %v", batchIndex, err)
+					continue
+				}
+
+				// 保存非空数据到对应文件
+				if strings.TrimSpace(userID) != "" {
+					if err := fileManagers["user_id"].writeData(userID); err != nil {
+						log.Printf("Failed to write user_id in batch %d: %v", batchIndex, err)
+					}
+				}
+				if strings.TrimSpace(oaid) != "" {
+					if err := fileManagers["oaid"].writeData(oaid); err != nil {
+						log.Printf("Failed to write oaid in batch %d: %v", batchIndex, err)
+					}
+				}
+				if strings.TrimSpace(caid) != "" {
+					// caid可能包含多个值，用逗号分隔
+					caids := strings.Split(caid, ",")
+					for _, c := range caids {
+						if c = strings.TrimSpace(c); c != "" {
+							if err := fileManagers["caid"].writeData(c); err != nil {
+								log.Printf("Failed to write caid in batch %d: %v", batchIndex, err)
+							}
+						}
+					}
+				}
+				if strings.TrimSpace(idfa) != "" {
+					if err := fileManagers["idfa"].writeData(idfa); err != nil {
+						log.Printf("Failed to write idfa in batch %d: %v", batchIndex, err)
+					}
+				}
+				if strings.TrimSpace(imei) != "" {
+					if err := fileManagers["imei"].writeData(imei); err != nil {
+						log.Printf("Failed to write imei in batch %d: %v", batchIndex, err)
+					}
+				}
+
+				batchProcessed++
 			}
-			batch = batch[:0]
-		}
+			// 更新总处理计数
+			mu.Lock()
+			processed += int64(batchProcessed)
+			mu.Unlock()
+
+			log.Printf("Batch %d/%d completed: processed %d records, total processed: %d/%d",
+				batchIndex+1, totalBatches, batchProcessed, processed, totalCount)
+
+		}(batchNum)
 	}
-	if len(batch) > 0 {
-		// 保存batch数据到文件
-		if err := s.saveBatchToFile(task, batch, selectFields, filePath); err != nil {
-			log.Printf("Failed to save batch to file: %v", err)
-		}
+
+	// 等待所有批次完成
+	wg.Wait()
+
+	// 检查是否有错误
+	if firstErr != nil {
+		return fmt.Errorf("batch processing failed: %w", firstErr)
 	}
-	log.Printf("Processed %d records for hash_id range", processed)
+	log.Printf("All parallel batches completed: %d records processed", processed)
+
+	// 直接压缩文件夹为zip（无需复制，直接压缩现有文件）
+	zipPath := filepath.Join(baseAddress, fmt.Sprintf("task_%d_%s.zip", task.ID, time.Now().Format("20060102150405")))
+	if err := s.zipDirectory(taskDir, zipPath); err != nil {
+		return fmt.Errorf("failed to create zip file: %w", err)
+	}
+
+	// 删除临时文件夹
+	if err := os.RemoveAll(taskDir); err != nil {
+		log.Printf("Warning: failed to remove temp directory %s: %v", taskDir, err)
+	}
+
+	// 存储zip文件路径
+	s.taskFilePaths.Store(task.ID, zipPath)
+	log.Printf("Successfully created zip file: %s", zipPath)
+
 	return nil
 }
 
-// saveBatchToFile 将batch数据按selectFields顺序保存到文件，返回文件路径
-func (s *DistributionService) saveBatchToFile(task *module.Distribution, batch []map[string]string, selectFields []string, filePath string) error {
+// fileManager 文件管理器，用于管理单个数据类型的文件写入
+type fileManager struct {
+	baseDir     string
+	dataType    string
+	maxFileSize int64
+	currentFile *os.File
+	currentSize int64
+	fileIndex   int
+}
 
-	// 打开文件进行追加写入
-	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+// newFileManager 创建新的文件管理器
+func newFileManager(baseDir, dataType string, maxFileSize int64) *fileManager {
+	return &fileManager{
+		baseDir:     baseDir,
+		dataType:    dataType,
+		maxFileSize: maxFileSize,
+		fileIndex:   0,
+	}
+}
+
+// writeData 写入数据
+func (fm *fileManager) writeData(data string) error {
+	// md5加密
+	data = fmt.Sprintf("%x", md5.Sum([]byte(data)))
+	// 计算数据大小
+	dataSize := int64(len(data) + 1) // +1 for newline
+
+	// 如果当前文件不存在或者会超过大小限制，创建新文件
+	if fm.currentFile == nil || (fm.currentSize+dataSize > fm.maxFileSize) {
+		if err := fm.createNewFile(); err != nil {
+			return err
+		}
+	}
+
+	// 写入数据
+	if _, err := fm.currentFile.WriteString(data + "\n"); err != nil {
+		return fmt.Errorf("failed to write data: %w", err)
+	}
+
+	fm.currentSize += dataSize
+	return nil
+}
+
+// createNewFile 创建新文件
+func (fm *fileManager) createNewFile() error {
+	// 关闭当前文件
+	if fm.currentFile != nil {
+		fm.currentFile.Close()
+	}
+
+	// 生成文件名
+	var fileName string
+	if fm.fileIndex == 0 {
+		fileName = fmt.Sprintf("%s.txt", fm.dataType)
+	} else {
+		fileName = fmt.Sprintf("%s_%d.txt", fm.dataType, fm.fileIndex)
+	}
+
+	filePath := filepath.Join(fm.baseDir, fileName)
+
+	// 创建新文件
+	file, err := os.Create(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to open file for writing: %w", err)
-	}
-	defer file.Close()
-
-	// 将batch数据写入文件，按照selectFields的顺序
-	for _, item := range batch {
-		var values []string
-
-		// 按照selectFields的顺序输出字段
-		for _, field := range selectFields {
-			if field == "caid" {
-				// 处理多个caid字段的特殊情况
-				var caids []string
-				for i := 1; ; i++ {
-					if caid, exists := item[fmt.Sprintf("caid_%d", i)]; exists {
-						caids = append(caids, caid)
-					} else {
-						break
-					}
-				}
-				if len(caids) > 0 {
-					values = append(values, strings.Join(caids, ","))
-				} else {
-					values = append(values, "") // 空值占位
-				}
-			} else {
-				// 普通字段处理
-				if val, exists := item[field]; exists {
-					values = append(values, val)
-				} else {
-					values = append(values, "") // 空值占位
-				}
-			}
-		}
-
-		// 如果有数据，写入文件
-		if len(values) > 0 {
-			line := strings.Join(values, "\t") + "\n"
-			if _, err := file.WriteString(line); err != nil {
-				return fmt.Errorf("failed to write to file: %w", err)
-			}
-		}
+		return fmt.Errorf("failed to create file %s: %w", filePath, err)
 	}
 
-	log.Printf("Saved %d records to file", len(batch))
+	fm.currentFile = file
+	fm.currentSize = 0
+	fm.fileIndex++
+
+	log.Printf("Created new file: %s", filePath)
+	return nil
+}
+
+// zipDirectory 将目录压缩为zip文件（优化版本，直接压缩无复制）
+func (s *DistributionService) zipDirectory(sourceDir, zipPath string) error {
+	log.Printf("Starting zip compression: %s -> %s", sourceDir, zipPath)
+	startTime := time.Now()
+
+	// 创建zip文件
+	zipFile, err := os.Create(zipPath)
+	if err != nil {
+		return fmt.Errorf("failed to create zip file: %w", err)
+	}
+	defer zipFile.Close()
+
+	// 创建zip writer
+	zipWriter := zip.NewWriter(zipFile)
+	defer zipWriter.Close()
+
+	// 遍历源目录
+	err = filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// 跳过目录本身
+		if info.IsDir() {
+			return nil
+		}
+
+		// 创建zip文件内的路径
+		relPath, err := filepath.Rel(sourceDir, path)
+		if err != nil {
+			return fmt.Errorf("failed to get relative path: %w", err)
+		}
+
+		log.Printf("Adding file to zip: %s (size: %d bytes)", relPath, info.Size())
+
+		// 在zip中创建文件
+		zipFileWriter, err := zipWriter.Create(relPath)
+		if err != nil {
+			return fmt.Errorf("failed to create file in zip: %w", err)
+		}
+
+		// 读取源文件
+		sourceFile, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("failed to open source file: %w", err)
+		}
+		defer sourceFile.Close()
+
+		// 使用缓冲区复制文件内容到zip，提高效率
+		buffer := make([]byte, 32*1024) // 32KB缓冲区
+		_, err = io.CopyBuffer(zipFileWriter, sourceFile, buffer)
+		if err != nil {
+			return fmt.Errorf("failed to copy file to zip: %w", err)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Zip compression completed in %v: %s", time.Since(startTime), zipPath)
 	return nil
 }
