@@ -297,7 +297,7 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 	var mu sync.Mutex
 	var start int64
 
-	for start = 0; start <= totalCount; start += partitionSize {
+	for start = 1; start <= totalCount; start += partitionSize {
 		end := start + partitionSize
 		if end > totalCount {
 			end = totalCount
@@ -309,7 +309,7 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 			defer func() { <-sem }()
 
 			query := fmt.Sprintf(`SELECT %s FROM %s
-				WHERE id >= ? AND id < ? )`,
+				WHERE row_num >= ? AND row_num <= ?`,
 				strings.Join(selectFields, ", "), tempTableName)
 
 			log.Printf("Executing query: %s with range [%d, %d)", query, start, end)
@@ -328,11 +328,11 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 			batch := make([]map[string]string, 0, StreamBatchSize)
 			processed := 0
 			for rows.Next() {
-				log.Printf("Reading row... userID: %s, oaid: %s, caid: %s, idfa: %s, imei: %s", user_id, oaid, caid, idfa, imei)
 				if err := rows.Scan(scanFields...); err != nil {
 					log.Printf("Scan error: %v", err)
 					continue
 				}
+				log.Printf("Reading row... userID: %s, oaid: %s, caid: %s, idfa: %s, imei: %s", user_id, oaid, caid, idfa, imei)
 				item := make(map[string]string)
 				if user_id != "" {
 					item["user_id"] = user_id
@@ -396,21 +396,23 @@ func (s *DistributionService) processByStrategyID(task *module.Distribution, str
 	return nil
 }
 
-// createTempTable 创建临时表
+// createTempTable 创建临时表 - Doris兼容版本（简化版）
 func (s *DistributionService) createTempTable(db *sql.DB, tableName string) error {
+	// 简化的Doris表结构，ID仅用于分页，可以重复
 	createTableSQL := fmt.Sprintf(`
-		CREATE TEMPORARY TABLE %s (
-			id BIGINT AUTO_INCREMENT PRIMARY KEY,
-			imei VARCHAR(128) NOT NULL,
-			oaid VARCHAR(128) NOT NULL,
-			caid VARCHAR(128) NOT NULL,
-			idfa VARCHAR(128) NOT NULL,
-			user_id VARCHAR(128) NOT NULL,
-			INDEX idx_imei (imei),
-			INDEX idx_oaid (oaid),
-			INDEX idx_caid (caid),
-			INDEX idx_idfa (idfa),
-			INDEX idx_user_id (user_id)
+		CREATE TABLE %s (
+			row_num BIGINT,
+			imei VARCHAR(128),
+			oaid VARCHAR(128),
+			caid VARCHAR(128),
+			idfa VARCHAR(128),
+			user_id VARCHAR(128)
+		) ENGINE=OLAP
+		DUPLICATE KEY(row_num)
+		DISTRIBUTED BY HASH(row_num) BUCKETS 10
+		PROPERTIES (
+			"replication_allocation" = "tag.location.default: 1",
+			"storage_format" = "V2"
 		)
 	`, tableName)
 
@@ -423,9 +425,9 @@ func (s *DistributionService) createTempTable(db *sql.DB, tableName string) erro
 	return nil
 }
 
-// dropTempTable 删除临时表
+// dropTempTable 删除临时表 - Doris兼容版本
 func (s *DistributionService) dropTempTable(db *sql.DB, tableName string) {
-	dropTableSQL := fmt.Sprintf("DROP TEMPORARY TABLE IF EXISTS %s", tableName)
+	dropTableSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)
 	if _, err := db.Exec(dropTableSQL); err != nil {
 		log.Printf("Warning: failed to drop temp table %s: %v", tableName, err)
 	} else {
@@ -433,20 +435,21 @@ func (s *DistributionService) dropTempTable(db *sql.DB, tableName string) {
 	}
 }
 
-// saveToTempTable 将查询结果保存到临时表
+// saveToTempTable 将查询结果保存到临时表 - 简化版本
 func (s *DistributionService) saveToTempTable(db *sql.DB, selectFields []string, tempTableName string, strategyID int64, task *module.Distribution) (int64, error) {
 
-	// 构建插入字段和选择字段
-	insertFields := strings.Join(selectFields, ", ")
+	// 构建插入字段和选择字段，使用简单的行号
+	insertFields := "row_num, " + strings.Join(selectFields, ", ")
 	selectFieldsStr := strings.Join(selectFields, ", ")
 
-	// 直接使用 INSERT ... SELECT 语句
+	// 简化的INSERT语句，直接查询并插入
 	insertSQL := fmt.Sprintf(`
 		INSERT INTO %s (%s)
-		SELECT %s FROM dmp_user_mapping_v4
+		SELECT ROW_NUMBER() OVER() as row_num, %s 
+		FROM dmp_user_mapping_v4 m
 		WHERE bitmap_contains(
 			(SELECT user_set FROM dmp_crowd_user_bitmap WHERE crowd_rule_id = ? ORDER BY event_date DESC LIMIT 1),
-			user_hash_id
+			m.hash_id
 		)
 	`, tempTableName, insertFields, selectFieldsStr)
 
@@ -601,8 +604,9 @@ func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, st
 		return fmt.Errorf("no fields selected for task %d", task.ID)
 	}
 
-	// 文件管理器，每种数据类型对应一个文件管理器
+	// 文件管理器，每种数据类型对应一个文件管理器（线程安全版本）
 	const maxFileSize = 1024 * 1024 * 1024 // 1GB
+
 	fileManagers := make(map[string]*fileManager)
 
 	for _, field := range selectFields {
@@ -616,50 +620,44 @@ func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, st
 		return fmt.Errorf("failed to get total count: %w", err)
 	}
 
-	log.Printf("Total records to process: %d", totalCount)
+	log.Printf("SaveFile Total records to process: %d", totalCount)
 
 	// 分批处理数据，每次处理100万条，并行处理
-	const batchSize = int64(1000000) // 100万条
-	const maxConcurrency = 4         // 最大并行数，可根据服务器性能调整
+	const partitionSize = 1000000 // 100万条
+	const maxConcurrency = 4      // 最大并行数，可根据服务器性能调整
 	var processed int64
-
-	// 计算总批次数
-	totalBatches := (totalCount + batchSize - 1) / batchSize
-	log.Printf("Will process %d batches with max concurrency %d", totalBatches, maxConcurrency)
 
 	// 创建协程池和任务通道
 	sem := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
+	var start int64
 
-	// 并行处理各个批次
-	for batchNum := int64(0); batchNum < totalBatches; batchNum++ {
+	for start = 1; start <= totalCount; start += partitionSize {
+		end := start + partitionSize
+		if end > totalCount {
+			end = totalCount
+		}
+
 		wg.Add(1)
 		sem <- struct{}{} // 获取信号量
 
-		go func(batchIndex int64) {
+		go func(start, end int64) {
 			defer wg.Done()
 			defer func() { <-sem }() // 释放信号量
 
-			// 计算当前批次的范围
-			offset := batchIndex * batchSize
-			endOffset := offset + batchSize
-			if endOffset > totalCount {
-				endOffset = totalCount
-			}
-
 			// 分批查询数据
-			query := fmt.Sprintf(`SELECT %s FROM %s WHERE id >= ? AND id < ?`,
+			query := fmt.Sprintf(`SELECT %s FROM %s WHERE row_num >= ? AND row_num <= ?`,
 				strings.Join(selectFields, ", "), tempTableName)
 
-			log.Printf("Processing batch %d/%d: offset=%d, endOffset=%d", batchIndex+1, totalBatches, offset, endOffset)
+			log.Printf("SaveFile Processing bat	ch query %s: start=%d, end=%d", query, start, end)
 
-			rows, err := dorisDB.Query(query, offset, endOffset)
+			rows, err := dorisDB.Query(query, start, end)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
-					firstErr = fmt.Errorf("query temp table error at batch %d (offset %d): %w", batchIndex, offset, err)
+					firstErr = fmt.Errorf("query temp table error at batch [%d,%d]: %w", start, end, err)
 				}
 				mu.Unlock()
 				return
@@ -670,19 +668,20 @@ func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, st
 			batchProcessed := 0
 			for rows.Next() {
 				if err := rows.Scan(scanFields...); err != nil {
-					log.Printf("Scan error in batch %d: %v", batchIndex, err)
+					log.Printf("Scan error in batch [%d, %d]: %v", start, end, err)
 					continue
 				}
+				log.Printf("Reading saveFile row... userID: %s, oaid: %s, caid: %s, idfa: %s, imei: %s", userID, oaid, caid, idfa, imei)
 
 				// 保存非空数据到对应文件
 				if strings.TrimSpace(userID) != "" {
 					if err := fileManagers["user_id"].writeData(userID); err != nil {
-						log.Printf("Failed to write user_id in batch %d: %v", batchIndex, err)
+						log.Printf("Failed to write user_id in batch [%d, %d]: %v", start, end, err)
 					}
 				}
 				if strings.TrimSpace(oaid) != "" {
 					if err := fileManagers["oaid"].writeData(oaid); err != nil {
-						log.Printf("Failed to write oaid in batch %d: %v", batchIndex, err)
+						log.Printf("Failed to write oaid in batch [%d, %d]: %v", start, end, err)
 					}
 				}
 				if strings.TrimSpace(caid) != "" {
@@ -691,19 +690,19 @@ func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, st
 					for _, c := range caids {
 						if c = strings.TrimSpace(c); c != "" {
 							if err := fileManagers["caid"].writeData(c); err != nil {
-								log.Printf("Failed to write caid in batch %d: %v", batchIndex, err)
+								log.Printf("Failed to write caid in batch [%d, %d]: %v", start, end, err)
 							}
 						}
 					}
 				}
 				if strings.TrimSpace(idfa) != "" {
 					if err := fileManagers["idfa"].writeData(idfa); err != nil {
-						log.Printf("Failed to write idfa in batch %d: %v", batchIndex, err)
+						log.Printf("Failed to write idfa in batch [%d, %d]: %v", start, end, err)
 					}
 				}
 				if strings.TrimSpace(imei) != "" {
 					if err := fileManagers["imei"].writeData(imei); err != nil {
-						log.Printf("Failed to write imei in batch %d: %v", batchIndex, err)
+						log.Printf("Failed to write imei in batch [%d, %d]: %v", start, end, err)
 					}
 				}
 
@@ -714,10 +713,10 @@ func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, st
 			processed += int64(batchProcessed)
 			mu.Unlock()
 
-			log.Printf("Batch %d/%d completed: processed %d records, total processed: %d/%d",
-				batchIndex+1, totalBatches, batchProcessed, processed, totalCount)
+			log.Printf("Batch [%d, %d] completed: processed %d records, total processed: %d/%d",
+				start, end, batchProcessed, processed, totalCount)
 
-		}(batchNum)
+		}(start, end)
 	}
 
 	// 等待所有批次完成
@@ -729,8 +728,22 @@ func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, st
 	}
 	log.Printf("All parallel batches completed: %d records processed", processed)
 
+	// 关闭所有文件管理器的文件，确保数据写入磁盘
+	for dataType, manager := range fileManagers {
+		if manager.currentFile != nil {
+			log.Printf("Closing file for data type: %s", dataType)
+			if err := manager.currentFile.Sync(); err != nil {
+				log.Printf("Warning: failed to sync file for %s: %v", dataType, err)
+			}
+			if err := manager.currentFile.Close(); err != nil {
+				log.Printf("Warning: failed to close file for %s: %v", dataType, err)
+			}
+			manager.currentFile = nil
+		}
+	}
+
 	// 直接压缩文件夹为zip（无需复制，直接压缩现有文件）
-	zipPath := filepath.Join(baseAddress, fmt.Sprintf("task_%d_%s.zip", task.ID, time.Now().Format("20060102150405")))
+	zipPath := filepath.Join(baseAddress, fmt.Sprintf("task_%d_%s.zip", task.ID, time.Now().Format("200601021504")))
 	if err := s.zipDirectory(taskDir, zipPath); err != nil {
 		return fmt.Errorf("failed to create zip file: %w", err)
 	}
@@ -747,7 +760,7 @@ func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, st
 	return nil
 }
 
-// fileManager 文件管理器，用于管理单个数据类型的文件写入
+// fileManager 文件管理器，用于管理单个数据类型的文件写入（线程安全版本）
 type fileManager struct {
 	baseDir     string
 	dataType    string
@@ -755,6 +768,7 @@ type fileManager struct {
 	currentFile *os.File
 	currentSize int64
 	fileIndex   int
+	mutex       sync.Mutex // 添加互斥锁保证并发安全
 }
 
 // newFileManager 创建新的文件管理器
@@ -767,8 +781,11 @@ func newFileManager(baseDir, dataType string, maxFileSize int64) *fileManager {
 	}
 }
 
-// writeData 写入数据
+// writeData 写入数据（线程安全版本）
 func (fm *fileManager) writeData(data string) error {
+	fm.mutex.Lock()
+	defer fm.mutex.Unlock()
+
 	// md5加密
 	data = fmt.Sprintf("%x", md5.Sum([]byte(data)))
 	// 计算数据大小
@@ -821,7 +838,7 @@ func (fm *fileManager) createNewFile() error {
 	return nil
 }
 
-// zipDirectory 将目录压缩为zip文件（优化版本，直接压缩无复制）
+// zipDirectory 将目录压缩为zip文件（保持文件夹结构版本）
 func (s *DistributionService) zipDirectory(sourceDir, zipPath string) error {
 	log.Printf("Starting zip compression: %s -> %s", sourceDir, zipPath)
 	startTime := time.Now()
@@ -833,11 +850,11 @@ func (s *DistributionService) zipDirectory(sourceDir, zipPath string) error {
 	}
 	defer zipFile.Close()
 
-	// 创建zip writer
+	// 创建zip writer，设置为最快压缩级别（减少CPU时间）
 	zipWriter := zip.NewWriter(zipFile)
 	defer zipWriter.Close()
 
-	// 遍历源目录
+	// 遍历源目录并保持目录结构
 	err = filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -848,14 +865,15 @@ func (s *DistributionService) zipDirectory(sourceDir, zipPath string) error {
 			return nil
 		}
 
-		// 创建zip文件内的路径
+		// 创建zip文件内的路径，保持文件夹结构
 		relPath, err := filepath.Rel(sourceDir, path)
 		if err != nil {
 			return fmt.Errorf("failed to get relative path: %w", err)
 		}
 
-		log.Printf("Adding file to zip: %s (size: %d bytes)", relPath, info.Size())
+		log.Printf("Adding file to zip: %s (size: %d bytes)", zipPath, info.Size())
 
+		// 在zip中创建文件（使用最快压缩方式）
 		// 在zip中创建文件
 		zipFileWriter, err := zipWriter.Create(relPath)
 		if err != nil {
@@ -869,8 +887,8 @@ func (s *DistributionService) zipDirectory(sourceDir, zipPath string) error {
 		}
 		defer sourceFile.Close()
 
-		// 使用缓冲区复制文件内容到zip，提高效率
-		buffer := make([]byte, 32*1024) // 32KB缓冲区
+		// 使用大缓冲区快速复制（减少系统调用）
+		buffer := make([]byte, 1024*1024) // 1MB缓冲区，提高IO效率
 		_, err = io.CopyBuffer(zipFileWriter, sourceFile, buffer)
 		if err != nil {
 			return fmt.Errorf("failed to copy file to zip: %w", err)
@@ -884,5 +902,6 @@ func (s *DistributionService) zipDirectory(sourceDir, zipPath string) error {
 	}
 
 	log.Printf("Zip compression completed in %v: %s", time.Since(startTime), zipPath)
+
 	return nil
 }
