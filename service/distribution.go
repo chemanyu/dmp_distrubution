@@ -26,9 +26,9 @@ const (
 	// TaskStatusKey      = "dmp:distribution:task:status:%d"
 	// TaskProgressKey    = "dmp:distribution:task:progress:%d"
 	RetryMaxTimes      = 3
-	StreamBatchSize    = 100000
+	StreamBatchSize    = 500000
 	MaxParallelWorkers = 10
-	RedisBatchSize     = 500
+	RedisBatchSize     = 5000
 	TaskNoStartStatus  = 0 // 任务未开始状态
 	TaskWaitStatus     = 1
 	TaskRunStatus      = 2
@@ -622,8 +622,8 @@ func (s *DistributionService) saveFileByStrategyID(task *module.Distribution, st
 
 	log.Printf("SaveFile Total records to process: %d", totalCount)
 
-	// 分批处理数据，每次处理100万条，并行处理
-	const partitionSize = 1000000 // 100万条
+	// 分批处理数据，每次处理500万条，并行处理
+	const partitionSize = 5000000 // 500万条
 	const maxConcurrency = 4      // 最大并行数，可根据服务器性能调整
 	var processed int64
 
